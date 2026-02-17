@@ -67,9 +67,9 @@ body { font-family: 'Inter', system-ui; background:#f7f9fc; }
 
 <!-- Drawer -->
 <div id="drawerOverlay" onclick="closeDrawer()" class="fixed inset-0 bg-black/40 hidden z-40"></div>
-<div id="drawer" class="fixed right-0 top-0 h-full w-full max-w-md bg-white shadow-2xl z-50 transform translate-x-full transition">
+<div id="drawer" class="fixed right-0 top-0 h-full w-full max-w-md bg-white shadow-2xl z-50 transform translate-x-full transition flex flex-col">
 
-<div class="p-6 border-b flex justify-between items-center">
+<div class="p-6 border-b flex justify-between items-center shrink-0">
   <div>
     <h2 id="drawerTitle" class="font-bold text-xl"></h2>
     <p class="text-sm text-gray-500">Select files to include</p>
@@ -77,12 +77,12 @@ body { font-family: 'Inter', system-ui; background:#f7f9fc; }
   <button onclick="closeDrawer()" class="text-3xl text-gray-400">&times;</button>
 </div>
 
-<form action="/download" method="post" class="flex flex-col h-full">
+<form action="/download" method="post" class="flex flex-col flex-1 min-h-0">
 <input type="hidden" name="course_ids" id="activeCourseId">
 
 <div id="fileList" class="flex-1 overflow-y-auto p-6 space-y-3 text-sm text-gray-700"></div>
 
-<div class="p-6 border-t">
+<div class="p-6 border-t shrink-0">
 <button type="submit" class="w-full py-3 rounded-xl bg-indigo-600 text-white font-semibold hover:bg-indigo-700">
 Download Selected Files
 </button>
