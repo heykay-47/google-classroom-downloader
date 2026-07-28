@@ -1,6 +1,6 @@
 # Google Classroom Auto File Downloader
 
-###NOTE: im currently developing a web version of this for easier access for people who prefer not to run scripts locally. the web version is on hold while i wait for google oauth verification!! please stay tuned and thank you for the patience
+### NOTE: I am currently developing a web version of this for easier access for people who prefer not to run scripts locally. The web version is on hold while I wait for Google OAuth verification. Please stay tuned and thank you for the patience.
 
 
 
@@ -32,7 +32,7 @@ google-classroom-downloader/
 │ └── README.md
 │
 ├── docs/ # Legal / public website
-├── web/ # Cloud Run web app
+├── app/ # Cloud Run web app (FastAPI)
 └── README.md # Project root README
 
 ````
@@ -149,6 +149,35 @@ downloads/
 ```
 
 ---
+
+## Web App Deployment (Cloud Run)
+
+### Required Environment Variables
+
+- `SESSION_SECRET`: Random secret for session cookies
+- `GOOGLE_OAUTH_JSON`: OAuth client JSON string (from Google Cloud Console)
+
+### Local Docker Run
+
+```bash
+docker build -t classroom-downloader .
+docker run -p 8080:8080 \
+  -e SESSION_SECRET="your-secret" \
+  -e GOOGLE_OAUTH_JSON='{"web":{...}}' \
+  classroom-downloader
+```
+
+### Deploy to Cloud Run
+
+```bash
+gcloud run deploy classroom-downloader \
+  --source . \
+  --region asia-south1 \
+  --set-env-vars SESSION_SECRET="your-secret" \
+  --set-env-vars GOOGLE_OAUTH_JSON='{"web":{...}}'
+```
+
+Make sure your OAuth redirect URI matches the deployed `/callback` URL.
 
 ## Advanced Usage
 

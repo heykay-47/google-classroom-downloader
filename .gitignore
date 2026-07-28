@@ -11,9 +11,13 @@ Thumbs.db
 __pycache__/
 *.py[cod]
 *$py.class
+.ruff_cache/
 venv/
 .venv/
 ENV/
+
+# Local agent state
+.agent/
 
 # Large local data / SDKs
 downloads/

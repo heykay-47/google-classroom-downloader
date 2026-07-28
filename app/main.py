@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from fastapi import FastAPI, Request, Form, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
@@ -77,9 +77,7 @@ def oauth_callback(request: Request):
         flow = get_flow(state=state)
         flow.fetch_token(authorization_response=str(request.url))
 
-        request.session["token"] = json.loads(
-            flow.credentials.to_json()
-        )
+        request.session["token"] = json.loads(flow.credentials.to_json())
 
         return RedirectResponse("/courses")
 
@@ -93,56 +91,82 @@ def courses(request: Request):
     if "token" not in request.session:
         return RedirectResponse("/login")
 
-    creds = Credentials.from_authorized_user_info(
-        request.session["token"], SCOPES
-    )
+    creds = Credentials.from_authorized_user_info(request.session["token"], SCOPES)
 
     classroom = build("classroom", "v1", credentials=creds)
-    courses = list_all_courses(classroom)
+    try:
+        courses = list_all_courses(classroom)
+        error_message = None
+    except HTTPException as exc:
+        logger.warning("Failed to load courses: %s", exc.detail)
+        courses = []
+        error_message = exc.detail
 
     return templates.TemplateResponse(
         "courses.html",
         {
             "request": request,
             "courses": courses,
+            "error": error_message,
         },
     )
 
 
+@app.get("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/login")
+
+
 # ======================= FIXED ENDPOINT =======================
+
 
 @app.post("/download")
 def download(
     request: Request,
     course_ids: list[str] = Form(None),
     file_ids: list[str] = Form(None),
+    download_scope: str = Form("courses"),
 ):
     if "token" not in request.session:
         return RedirectResponse("/login")
 
-    creds = Credentials.from_authorized_user_info(
-        request.session["token"], SCOPES
-    )
+    if download_scope == "files":
+        if not file_ids:
+            raise HTTPException(status_code=400, detail="Select at least one file")
+    elif download_scope == "courses":
+        if not course_ids:
+            raise HTTPException(status_code=400, detail="Select at least one course")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid download scope")
+
+    creds = Credentials.from_authorized_user_info(request.session["token"], SCOPES)
 
     classroom = build("classroom", "v1", credentials=creds)
     drive = build("drive", "v3", credentials=creds)
 
     def gen():
-        if file_ids:
+        if download_scope == "files":
             logger.info(f"=== DOWNLOADING {len(file_ids)} SELECTED FILES ===")
             for fid in file_ids:
-                name, data = download_file_bytes(drive, fid)
-                if name and data:
-                    yield f"files/{name}", data
+                try:
+                    name, data = download_file_bytes(drive, fid)
+                    if name and data:
+                        yield f"files/{name}", data
+                except Exception:
+                    logger.exception("Failed to download file %s", fid)
         else:
             logger.info(f"=== STARTING DOWNLOAD FOR {len(course_ids)} COURSES ===")
             for cid in course_ids:
                 logger.info(f"Processing Course: {cid}")
                 files = list_course_files(classroom, cid)
                 for fid, _ in files:
-                    name, data = download_file_bytes(drive, fid)
-                    if name and data:
-                        yield f"{cid}/{name}", data
+                    try:
+                        name, data = download_file_bytes(drive, fid)
+                        if name and data:
+                            yield f"{cid}/{name}", data
+                    except Exception:
+                        logger.exception("Failed to download file %s", fid)
         logger.info("=== ZIP GENERATION COMPLETE ===")
 
     return stream_zip(gen())
@@ -155,9 +179,20 @@ def download(
 def get_course_files(request: Request, course_id: str):
     if "token" not in request.session:
         raise HTTPException(status_code=401)
-    
-    creds = Credentials.from_authorized_user_info(request.session["token"], SCOPES)
-    classroom = build("classroom", "v1", credentials=creds)
-    
-    files = list_course_files(classroom, course_id)
-    return [{"id": f[0], "name": f[1]} for f in files]
+
+    try:
+        creds = Credentials.from_authorized_user_info(request.session["token"], SCOPES)
+        classroom = build("classroom", "v1", credentials=creds)
+        files = list_course_files(classroom, course_id)
+        return [{"id": f[0], "name": f[1]} for f in files]
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": exc.detail},
+        )
+    except Exception:
+        logger.exception("Failed to load files for course %s", course_id)
+        return JSONResponse(
+            status_code=502,
+            content={"error": "Failed to fetch course files"},
+        )
