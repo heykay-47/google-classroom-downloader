@@ -8,7 +8,7 @@ import time
 import shutil
 import subprocess
 import tempfile
-from typing import Dict, Set, List, Tuple
+from typing import Dict, List, Tuple
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -18,13 +18,18 @@ from gcr_downloader.catalog import CatalogError, list_course_files, list_courses
 from gcr_downloader.files import (
     GOOGLE_EXPORTS,
     SCOPES,
+    conversion_kind,
     ensure_extension,
     is_video_file,
     safe_filename,
-    validate_course_id,
-    validate_file_id,
 )
-from gcr_downloader.models import Course, CourseFile
+from gcr_downloader.models import (
+    Course,
+    CourseFile,
+    DownloadOptions,
+    DownloadReport,
+    ItemResult,
+)
 
 TOKEN_FILE = "token.json"
 INDEX_FILE = "download_index.json"
@@ -256,98 +261,34 @@ def check_libreoffice_available() -> Tuple[bool, str]:
     return False, ""
 
 
-def convert_to_pdf(
-    file_path: pathlib.Path,
-    libreoffice_cmd: str,
-    delete_original: bool = False,
-) -> bool:
+def convert_to_pdf(file_path: pathlib.Path, libreoffice_cmd: str) -> tuple[pathlib.Path | None, str]:
     pdf_path = file_path.with_suffix(".pdf")
     if pdf_path.exists():
-        print(f"PDF already exists, skipping conversion: {pdf_path}")
-        return True
-
+        return None, "PDF destination already exists"
     try:
         subprocess.run(
-            [
-                libreoffice_cmd,
-                "--headless",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                str(file_path.parent),
-                str(file_path),
-            ],
+            [libreoffice_cmd, "--headless", "--convert-to", "pdf", "--outdir", str(file_path.parent), str(file_path)],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
     except FileNotFoundError:
-        print("LibreOffice not found. Skipping conversion.")
-        return False
-    except subprocess.CalledProcessError as exc:
-        error_msg = exc.stderr.strip() or str(exc)
-        print(f"Failed to convert {file_path} to PDF: {error_msg}")
-        return False
-
-    if not pdf_path.exists():
-        print(f"Conversion did not produce PDF for: {file_path}")
-        return False
-
-    print(f"Converted to PDF: {pdf_path}")
-
-    if delete_original:
-        try:
-            file_path.unlink()
-            print(f"Deleted original: {file_path}")
-        except OSError as exc:
-            print(f"Failed to delete original {file_path}: {exc}")
-
-    return True
+        return None, "LibreOffice not found"
+    except subprocess.CalledProcessError:
+        return None, "LibreOffice conversion failed"
+    if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+        return None, "Conversion did not produce a non-empty PDF"
+    return pdf_path, ""
 
 
-def convert_downloaded_files(
-    base_dir: pathlib.Path,
-    convert_ppt: bool,
-    convert_docx: bool,
-    delete_originals: bool,
-    libreoffice_cmd: str,
-    downloaded_ids: Dict[str, str],
-) -> None:
-    extensions: Set[str] = set()
-    if convert_ppt:
-        extensions.update({".ppt", ".pptx"})
-    if convert_docx:
-        extensions.update({".doc", ".docx"})
-
-    if not extensions:
-        return
-
-    print("\nConverting documents to PDF...")
-    files = [
-        path
-        for path in base_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in extensions
-    ]
-
-    if not files:
-        print("No matching files found for conversion.")
-        return
-
-    for file_path in files:
-        converted = convert_to_pdf(
-            file_path,
-            libreoffice_cmd,
-            delete_original=delete_originals,
-        )
-        pdf_path = file_path.with_suffix(".pdf")
-        if not converted or file_path.exists() or not pdf_path.exists():
-            continue
-
-        source_path = file_path.resolve()
-        for file_id, stored_path in downloaded_ids.items():
-            if get_indexed_path(base_dir, stored_path) == source_path:
-                downloaded_ids[file_id] = str(pdf_path.resolve().relative_to(base_dir.resolve()))
+def render_report(report: DownloadReport) -> None:
+    print("\nDownload summary:")
+    for status, count in sorted(report.summary().items()):
+        print(f"  {status}: {count}")
+    for item in report.items:
+        if item.status.startswith("skipped_") or item.status.endswith("_failed"):
+            print(f"  {item.source_name}: {item.message}")
 
 
 # ---------- CORE LOGIC ----------
@@ -359,74 +300,82 @@ def download_all_for_course(
     course: Course,
     base_dir: pathlib.Path,
     downloaded_ids: Dict[str, str],
+    options: DownloadOptions,
+    report: DownloadReport,
+    libreoffice_cmd: str = "",
     dry_run: bool = False,
-    download_videos: bool = True,
 ) -> None:
-    course_id = course.id
-
-    # Validate course ID before processing
-    if not validate_course_id(course_id):
-        print(f"Warning: Invalid course ID format: {course_id}. Skipping.")
-        return
-
     base_path = base_dir.resolve()
-    course_name = course.name
-    course_dir = base_path / safe_filename(course_name)
-
-    print(f"\n=== Course: {course_name} (id={course_id}) ===")
-
-    files = list_course_files(classroom_service, course_id)
-    print(f"Found {len(files)} attached Drive files in this course.")
-
-    for course_file in files:
-        file_id = course_file.id
-        name_hint = course_file.title_hint
-        # Validate file ID before processing
-        if not validate_file_id(file_id):
-            print(f"Warning: Invalid file ID format: {file_id}. Skipping.")
-            continue
-
-        # Get metadata from Drive
+    course_dir = base_path / safe_filename(course.name)
+    for course_file in list_course_files(classroom_service, course.id):
         try:
-            meta = (
-                drive_service.files()
-                .get(
-                    fileId=file_id,
-                    fields="name,mimeType",
-                )
-                .execute()
-            )
-        except Exception as e:
-            print(f"Error fetching metadata for file {file_id}: {e}")
+            metadata = drive_service.files().get(
+                fileId=course_file.id,
+                fields="name,mimeType",
+            ).execute()
+        except Exception:
+            report.add(ItemResult(course.name, course_file.title_hint, "download_failed", message="Failed to fetch file metadata"))
             continue
 
-        fname = meta.get("name") or name_hint or file_id
-        mime_type = meta.get("mimeType")
-
-        fname = safe_filename(fname)
-        fname = ensure_extension(fname, mime_type)
-
-        if not download_videos and is_video_file(fname, mime_type):
-            print(f"Skipping video file: {fname}")
-            continue
-
-        dest_path = course_dir / fname
-        if file_id in downloaded_ids:
-            indexed_path = get_indexed_path(base_path, downloaded_ids[file_id])
-            if indexed_path is not None and indexed_path.exists():
-                print(f"File already exists locally, skipping: {indexed_path}")
-                downloaded_ids[file_id] = str(indexed_path.relative_to(base_path))
-                continue
-            downloaded_ids.pop(file_id)
-
-        # Handle duplicate filenames from different files
-        dest_path = get_unique_path(dest_path)
-
-        success = download_drive_file(
-            drive_service, file_id, dest_path, mime_type, dry_run=dry_run
+        source_name = ensure_extension(
+            safe_filename(metadata.get("name") or course_file.title_hint),
+            metadata.get("mimeType"),
         )
-        if success or dry_run:
-            downloaded_ids[file_id] = str(dest_path.relative_to(base_path))
+        if not options.include_videos and is_video_file(source_name, metadata.get("mimeType")):
+            report.add(ItemResult(course.name, source_name, "skipped_video", message="Video excluded"))
+            continue
+
+        indexed_path = get_indexed_path(base_path, downloaded_ids.get(course_file.id, ""))
+        if indexed_path is not None and indexed_path.exists():
+            relative = indexed_path.relative_to(base_path).as_posix()
+            downloaded_ids[course_file.id] = relative
+            report.add(ItemResult(course.name, source_name, "skipped_existing", (relative,), "File already exists"))
+            continue
+        downloaded_ids.pop(course_file.id, None)
+
+        destination = get_unique_path(course_dir / source_name)
+        relative_destination = destination.relative_to(base_path).as_posix()
+        if dry_run:
+            download_drive_file(
+                drive_service,
+                course_file.id,
+                destination,
+                metadata.get("mimeType"),
+                dry_run=True,
+            )
+            report.add(ItemResult(course.name, source_name, "dry_run", (relative_destination,)))
+            continue
+
+        if not download_drive_file(
+            drive_service,
+            course_file.id,
+            destination,
+            metadata.get("mimeType"),
+        ):
+            report.add(ItemResult(course.name, source_name, "download_failed", message="Download failed after three attempts"))
+            continue
+
+        downloaded_ids[course_file.id] = relative_destination
+        if conversion_kind(source_name, options) is None:
+            report.add(ItemResult(course.name, source_name, "downloaded", (relative_destination,)))
+            continue
+
+        pdf_path, error = convert_to_pdf(destination, libreoffice_cmd)
+        if pdf_path is None:
+            report.add(ItemResult(course.name, source_name, "conversion_failed", (relative_destination,), error))
+            continue
+
+        relative_pdf = pdf_path.relative_to(base_path).as_posix()
+        outputs = (relative_destination, relative_pdf)
+        if not options.keep_originals:
+            try:
+                destination.unlink()
+            except OSError:
+                report.add(ItemResult(course.name, source_name, "conversion_failed", outputs, "Converted PDF created but original could not be removed"))
+                continue
+            downloaded_ids[course_file.id] = relative_pdf
+            outputs = (relative_pdf,)
+        report.add(ItemResult(course.name, source_name, "converted", outputs))
 
 
 # ---------- MAIN / CLI ----------
@@ -578,7 +527,6 @@ def main() -> int:
         return 0
 
     conversion_prefs = get_conversion_preferences()
-    download_videos = get_video_preference()
     libreoffice_cmd = ""
     if conversion_prefs["convert_ppt"] or conversion_prefs["convert_docx"]:
         available, libreoffice_cmd = check_libreoffice_available()
@@ -588,36 +536,34 @@ def main() -> int:
             conversion_prefs["convert_docx"] = False
             conversion_prefs["delete_originals"] = False
 
-    for c in selected_courses:
-        download_all_for_course(
-            classroom_service,
-            drive_service,
-            c,
-            base_dir,
-            downloaded_ids,
-            dry_run=args.dry_run,
-            download_videos=download_videos,
-        )
+    options = DownloadOptions(
+        include_videos=get_video_preference(),
+        convert_word=conversion_prefs["convert_docx"],
+        convert_powerpoint=conversion_prefs["convert_ppt"],
+        keep_originals=not conversion_prefs["delete_originals"],
+    )
+    report = DownloadReport()
 
-    if not args.dry_run and (
-        conversion_prefs["convert_ppt"] or conversion_prefs["convert_docx"]
-    ):
-        convert_downloaded_files(
-            base_dir=base_dir,
-            convert_ppt=conversion_prefs["convert_ppt"],
-            convert_docx=conversion_prefs["convert_docx"],
-            delete_originals=conversion_prefs["delete_originals"],
-            libreoffice_cmd=libreoffice_cmd,
-            downloaded_ids=downloaded_ids,
-        )
+    try:
+        for course in selected_courses:
+            download_all_for_course(
+                classroom_service,
+                drive_service,
+                course,
+                base_dir,
+                downloaded_ids,
+                options,
+                report,
+                libreoffice_cmd=libreoffice_cmd,
+                dry_run=args.dry_run,
+            )
+    except CatalogError as exc:
+        print(str(exc))
+        return 1
 
     if not args.dry_run:
-        print("\nSaving download index...")
         save_index(downloaded_ids)
-        print("Done. All new files downloaded.")
-    else:
-        print("\nDry run completed. No files were actually downloaded.")
-
+    render_report(report)
     return 0
 
 

@@ -17,7 +17,13 @@ sys.path.insert(0, str(ROOT / "cli"))
 import classroom_downloader as downloader
 
 from gcr_downloader.catalog import CatalogError
-from gcr_downloader.models import Course, CourseFile
+from gcr_downloader.models import (
+    Course,
+    CourseFile,
+    DownloadOptions,
+    DownloadReport,
+    ItemResult,
+)
 
 
 class FakeFiles:
@@ -134,15 +140,100 @@ class CliDownloaderTests(unittest.TestCase):
     def test_existing_pdf_does_not_delete_original_document(self):
         with tempfile.TemporaryDirectory() as directory:
             source = pathlib.Path(directory) / "report.docx"
-            pdf = source.with_suffix(".pdf")
+            existing_pdf = source.with_suffix(".pdf")
             source.write_bytes(b"source")
-            pdf.write_bytes(b"existing")
+            existing_pdf.write_bytes(b"existing")
 
-            result = downloader.convert_to_pdf(source, "soffice", delete_original=True)
+            result_path, message = downloader.convert_to_pdf(source, "soffice")
 
-            self.assertTrue(result)
+            self.assertIsNone(result_path)
+            self.assertIn("already exists", message)
             self.assertTrue(source.exists())
-            self.assertEqual(pdf.read_bytes(), b"existing")
+            self.assertEqual(existing_pdf.read_bytes(), b"existing")
+
+    def test_empty_pdf_is_conversion_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = pathlib.Path(directory) / "report.docx"
+            source.write_bytes(b"source")
+
+            def create_empty_pdf(*_args, **_kwargs):
+                source.with_suffix(".pdf").write_bytes(b"")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(downloader.subprocess, "run", side_effect=create_empty_pdf):
+                pdf, message = downloader.convert_to_pdf(source, "soffice")
+
+            self.assertIsNone(pdf)
+            self.assertIn("non-empty PDF", message)
+            self.assertTrue(source.exists())
+
+    def test_report_renderer_shows_status_counts(self):
+        report = DownloadReport([
+            ItemResult("Course", "notes.pdf", "downloaded", ("Course/notes.pdf",)),
+            ItemResult("Course", "video.mp4", "skipped_video", message="Video excluded"),
+        ])
+        with mock.patch("builtins.print") as output:
+            downloader.render_report(report)
+        rendered = "\n".join(str(call.args[0]) for call in output.call_args_list if call.args)
+        self.assertIn("downloaded: 1", rendered)
+        self.assertIn("skipped_video: 1", rendered)
+
+    def test_replace_conversion_updates_index_only_after_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = pathlib.Path(directory)
+            downloaded_ids = {}
+            report = DownloadReport()
+
+            class MetadataRequest:
+                def execute(self):
+                    return {"name": "slides.pptx", "mimeType": "application/vnd.ms-powerpoint"}
+
+            class MetadataFiles:
+                def get(self, **_kwargs):
+                    return MetadataRequest()
+
+            class MetadataDrive:
+                def files(self):
+                    return MetadataFiles()
+
+            def download(_drive, _file_id, destination, _mime_type, **_kwargs):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"slides")
+                return True
+
+            def convert(source, _command):
+                pdf = source.with_suffix(".pdf")
+                pdf.write_bytes(b"%PDF-converted")
+                return pdf, ""
+
+            with mock.patch.object(
+                downloader,
+                "list_course_files",
+                return_value=[CourseFile("file-id", "slides.pptx")],
+            ), mock.patch.object(
+                downloader,
+                "download_drive_file",
+                side_effect=download,
+            ), mock.patch.object(
+                downloader,
+                "convert_to_pdf",
+                side_effect=convert,
+            ):
+                downloader.download_all_for_course(
+                    object(),
+                    MetadataDrive(),
+                    Course("course-id", "Course", "ACTIVE"),
+                    base_dir,
+                    downloaded_ids,
+                    DownloadOptions(convert_powerpoint=True, keep_originals=False),
+                    report,
+                    libreoffice_cmd="soffice",
+                )
+
+            self.assertFalse((base_dir / "Course" / "slides.pptx").exists())
+            self.assertEqual(downloaded_ids["file-id"], "Course/slides.pdf")
+            self.assertEqual(report.items[0].status, "converted")
+            self.assertEqual(report.items[0].output_paths, ("Course/slides.pdf",))
 
     def test_missing_duplicate_uses_recorded_relative_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -175,6 +266,8 @@ class CliDownloaderTests(unittest.TestCase):
                     Course("course-id", "Course", "ACTIVE"),
                     base_dir,
                     downloaded_ids,
+                    DownloadOptions(),
+                    DownloadReport(),
                 )
 
             download.assert_called_once()
@@ -212,6 +305,8 @@ class CliDownloaderTests(unittest.TestCase):
                     Course("course-id", "Course", "ACTIVE"),
                     base_dir,
                     downloaded_ids,
+                    DownloadOptions(),
+                    DownloadReport(),
                 )
 
             download.assert_called_once()
@@ -239,32 +334,6 @@ class CliDownloaderTests(unittest.TestCase):
             result = downloader.get_indexed_path(base_dir, "../outside.pdf")
 
             self.assertIsNone(result)
-
-    def test_deleted_converted_source_updates_download_index(self):
-        with tempfile.TemporaryDirectory() as directory:
-            base_dir = pathlib.Path(directory)
-            source = base_dir / "Course" / "slides.pptx"
-            source.parent.mkdir()
-            source.write_bytes(b"slides")
-            downloaded_ids = {"file-id": "Course/slides.pptx"}
-
-            def convert(file_path, _command, delete_original=False):
-                file_path.with_suffix(".pdf").write_bytes(b"pdf")
-                if delete_original:
-                    file_path.unlink()
-                return True
-
-            with mock.patch.object(downloader, "convert_to_pdf", side_effect=convert):
-                downloader.convert_downloaded_files(
-                    base_dir,
-                    convert_ppt=True,
-                    convert_docx=False,
-                    delete_originals=True,
-                    libreoffice_cmd="soffice",
-                    downloaded_ids=downloaded_ids,
-                )
-
-            self.assertEqual(downloaded_ids["file-id"], "Course/slides.pdf")
 
 
 if __name__ == "__main__":
