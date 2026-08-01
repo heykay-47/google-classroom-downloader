@@ -53,9 +53,16 @@ def install_dependency_stubs():
     fastapi.HTTPException = HTTPException
 
     fastapi_responses = types.ModuleType("fastapi.responses")
+
+    class StreamingResponse:
+        def __init__(self, content, media_type=None, headers=None):
+            self.body_iterator = content
+            self.media_type = media_type
+            self.headers = headers or {}
+
     fastapi_responses.RedirectResponse = type("RedirectResponse", (), {})
     fastapi_responses.JSONResponse = type("JSONResponse", (), {})
-    fastapi_responses.StreamingResponse = type("StreamingResponse", (), {})
+    fastapi_responses.StreamingResponse = StreamingResponse
 
     fastapi_templating = types.ModuleType("fastapi.templating")
 
@@ -72,8 +79,20 @@ def install_dependency_stubs():
     proxy_headers.ProxyHeadersMiddleware = type("ProxyHeadersMiddleware", (), {})
 
     zipstream = types.ModuleType("zipstream")
+
+    class StubZipFile:
+        def __init__(self, *args, **kwargs):
+            self.entries = []
+
+        def write_iter(self, path, iterable):
+            self.entries.append((path, iterable))
+
+        def __iter__(self):
+            for _path, iterable in self.entries:
+                yield from iterable
+
     zipstream.ZIP_DEFLATED = 1
-    zipstream.ZipFile = type("ZipFile", (), {})
+    zipstream.ZipFile = StubZipFile
 
     modules = {
         "google.oauth2.credentials": google_oauth_credentials,

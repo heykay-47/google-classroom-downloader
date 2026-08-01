@@ -1,3 +1,4 @@
+import io
 import unittest
 from unittest import mock
 
@@ -6,7 +7,18 @@ from test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from app import drive, main
+from app import drive, downloads, main, zipstreamer
+from app.drive import DriveMetadata
+from app.gotenberg import GotenbergError
+from app.zipstreamer import ArchiveEntry
+from gcr_downloader.catalog import CatalogError
+from gcr_downloader.models import (
+    Course,
+    CourseFile,
+    DownloadOptions,
+    DownloadReport,
+    ItemResult,
+)
 
 
 class WebAppTests(unittest.TestCase):
@@ -20,51 +32,128 @@ class WebAppTests(unittest.TestCase):
         paths = {route.path for route in main.app.routes}
         self.assertNotIn("/api/download/progress", paths)
 
-    def test_file_mode_rejects_empty_file_selection(self):
+    def test_download_rejects_empty_file_selection(self):
         request = type("Request", (), {"session": {"token": {}}})()
-        try:
-            with mock.patch.object(
-                main.Credentials,
-                "from_authorized_user_info",
-                return_value=object(),
-                create=True,
-            ), mock.patch.object(main, "build", return_value=object()):
-                main.download(
-                    request,
-                    course_ids=["course-id"],
-                    file_ids=None,
-                    download_scope="files",
-                )
-        except main.HTTPException as exc:
-            self.assertEqual(exc.status_code, 400)
-        except Exception as exc:
-            self.fail(f"empty file selection raised unexpected {exc!r}")
-        else:
-            self.fail("empty file selection was accepted")
+        with self.assertRaises(main.HTTPException) as error:
+            main.download(request, course_id="course-1", file_ids=None)
+        self.assertEqual(error.exception.status_code, 400)
 
-    def test_course_listing_failure_aborts_download(self):
+    def test_download_rejects_file_not_attached_to_course(self):
         request = type("Request", (), {"session": {"token": {}}})()
-        classroom = object()
-        drive_service = object()
+        course = Course("course-1", "Course", "ACTIVE")
+        available = [CourseFile("allowed", "Allowed")]
+        with mock.patch.object(main.Credentials, "from_authorized_user_info", return_value=object(), create=True), \
+             mock.patch.object(main, "build", side_effect=[object(), object()]), \
+             mock.patch.object(main, "get_course", return_value=course), \
+             mock.patch.object(main, "list_course_files", return_value=available):
+            with self.assertRaises(main.HTTPException) as error:
+                main.download(request, course_id="course-1", file_ids=["forged"])
+        self.assertEqual(error.exception.status_code, 400)
+
+    def test_course_catalog_failure_returns_502_before_preparation(self):
+        request = type("Request", (), {"session": {"token": {}}})()
+        with mock.patch.object(main.Credentials, "from_authorized_user_info", return_value=object(), create=True), \
+             mock.patch.object(main, "build", side_effect=[object(), object()]), \
+             mock.patch.object(main, "get_course", side_effect=CatalogError("Failed to fetch course")), \
+             mock.patch.object(main, "prepare_download") as prepare:
+            with self.assertRaises(main.HTTPException) as error:
+                main.download(request, course_id="course-1", file_ids=["file-1"])
+        self.assertEqual(error.exception.status_code, 502)
+        prepare.assert_not_called()
+
+    def test_download_builds_non_destructive_options(self):
+        request = type("Request", (), {"session": {"token": {}}})()
+        course = Course("course-1", "Course", "ACTIVE")
+        selected = [CourseFile("file-1", "Notes")]
+        response = object()
+        with mock.patch.object(main.Credentials, "from_authorized_user_info", return_value=object(), create=True), \
+             mock.patch.object(main, "build", side_effect=[object(), object()]), \
+             mock.patch.object(main, "get_course", return_value=course), \
+             mock.patch.object(main, "list_course_files", return_value=selected), \
+             mock.patch.object(main, "select_course_files", return_value=selected), \
+             mock.patch.object(main, "prepare_download", return_value=([], DownloadReport())) as prepare, \
+             mock.patch.object(main, "stream_zip", return_value=response):
+            result = main.download(
+                request,
+                course_id="course-1",
+                file_ids=["file-1"],
+                convert_word=True,
+                replace_originals=False,
+            )
+        self.assertIs(result, response)
+        self.assertEqual(
+            prepare.call_args.args[3],
+            DownloadOptions(convert_word=True, keep_originals=True),
+        )
+
+    def test_conversion_failure_keeps_original_and_reports_failure(self):
+        source = io.BytesIO(b"original")
         with mock.patch.object(
-            main.Credentials,
-            "from_authorized_user_info",
-            return_value=object(),
-            create=True,
+            downloads,
+            "get_metadata",
+            return_value=DriveMetadata("notes.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
         ), mock.patch.object(
-            main, "build", side_effect=[classroom, drive_service]
+            downloads,
+            "download_to_spool",
+            return_value=source,
         ), mock.patch.object(
-            main,
-            "list_course_files",
-            side_effect=main.HTTPException(status_code=502, detail="failed"),
-        ), mock.patch.object(main, "stream_zip", side_effect=lambda items: list(items)):
-            with self.assertRaises(main.HTTPException):
-                main.download(
-                    request,
-                    course_ids=["course-id"],
-                    file_ids=None,
-                    download_scope="courses",
-                )
+            downloads,
+            "convert_to_pdf",
+            side_effect=GotenbergError("Conversion service unavailable"),
+        ):
+            entries, report = downloads.prepare_download(
+                object(),
+                Course("course-1", "Course", "ACTIVE"),
+                [CourseFile("file-1", "Notes")],
+                DownloadOptions(convert_word=True, keep_originals=False),
+            )
+        self.assertEqual([entry.path for entry in entries], ["Course/notes.docx"])
+        self.assertEqual(report.items[0].status, "conversion_failed")
+        self.assertEqual(report.items[0].output_paths, ("Course/notes.docx",))
+
+    def test_replace_success_emits_only_pdf(self):
+        source = io.BytesIO(b"slides")
+        pdf = io.BytesIO(b"%PDF-converted")
+        with mock.patch.object(
+            downloads,
+            "get_metadata",
+            return_value=DriveMetadata("slides.pptx", "application/vnd.ms-powerpoint"),
+        ), mock.patch.object(downloads, "download_to_spool", return_value=source), \
+             mock.patch.object(downloads, "convert_to_pdf", return_value=pdf):
+            entries, report = downloads.prepare_download(
+                object(),
+                Course("course-1", "Course", "ACTIVE"),
+                [CourseFile("file-1", "Slides")],
+                DownloadOptions(convert_powerpoint=True, keep_originals=False),
+            )
+        self.assertEqual([entry.path for entry in entries], ["Course/slides.pdf"])
+        self.assertTrue(source.closed)
+        self.assertEqual(report.items[0].status, "converted")
+
+    def test_stream_zip_appends_report_and_closes_streams(self):
+        class FakeZip:
+            instance = None
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.entries = []
+                FakeZip.instance = self
+
+            def write_iter(self, path, iterable):
+                self.entries.append((path, iterable))
+
+            def __iter__(self):
+                for _path, iterable in self.entries:
+                    yield from iterable
+
+        source = io.BytesIO(b"notes")
+        report = DownloadReport([ItemResult("Course", "notes.txt", "downloaded", ("Course/notes.txt",))])
+        with mock.patch.object(zipstreamer.zipstream, "ZipFile", FakeZip):
+            response = zipstreamer.stream_zip([ArchiveEntry("Course/notes.txt", source)], report)
+            list(response.body_iterator)
+        self.assertEqual(FakeZip.instance.entries[-1][0], "_download_report.json")
+        self.assertTrue(FakeZip.instance.kwargs["allowZip64"])
+        self.assertTrue(source.closed)
 
 
 if __name__ == "__main__":
