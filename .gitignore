@@ -27,6 +27,7 @@ google-cloud-sdk/
 
 # Docker & deploy
 !cli/requirements.txt
+deploy/cloud-run-service.rendered.yaml
 
 
 # Logs

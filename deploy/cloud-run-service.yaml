@@ -1,0 +1,56 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: classroom-downloader-web
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/container-dependencies: '{"web":["gotenberg"]}'
+    spec:
+      containerConcurrency: 1
+      timeoutSeconds: 900
+      containers:
+        - name: web
+          image: __WEB_IMAGE__
+          ports:
+            - containerPort: 8080
+          env:
+            - name: GOTENBERG_URL
+              value: http://localhost:3000
+            - name: SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: classroom-session-secret
+                  key: latest
+            - name: GOOGLE_OAUTH_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: google-oauth-json
+                  key: latest
+          resources:
+            limits:
+              cpu: "1"
+              memory: 2Gi
+        - name: gotenberg
+          image: gotenberg/gotenberg:8.34.0-libreoffice
+          env:
+            - name: LIBREOFFICE_AUTO_START
+              value: "true"
+            - name: LIBREOFFICE_MAX_QUEUE_SIZE
+              value: "1"
+            - name: LIBREOFFICE_START_TIMEOUT
+              value: 60s
+            - name: API_TIMEOUT
+              value: 120s
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 48
