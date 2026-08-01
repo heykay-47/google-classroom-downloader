@@ -43,7 +43,7 @@ Parity means shared portable capabilities and semantics, not identical interacti
 | Office conversion | Word and PowerPoint conversion disabled by default; user selects file types | Gotenberg `/forms/libreoffice/convert` | Local LibreOffice CLI |
 | Originals | Kept by default; user may replace originals after successful conversion | ZIP includes original plus PDF, or PDF only in replace mode | Local files retain or delete original |
 | Conversion failure | Original always survives; failure is reported | Original remains in ZIP | Original remains on disk |
-| Retries | Bounded retries with exponential backoff | Drive and retryable Gotenberg failures | Drive failures |
+| Retries | Three attempts with `1s` then `2s` backoff | Drive and retryable Gotenberg failures | Drive failures |
 | Naming | Safe course/file names and deterministic numeric suffixes | Unique paths within current ZIP | Unique paths on local filesystem |
 | Reporting | Shared per-item outcomes and summary counts | `_download_report.json` in every ZIP | Concise terminal summary |
 | Download history | Not portable | Per-request deduplication only | Persistent `download_index.json` and local existence checks |
@@ -80,7 +80,7 @@ It does not download bytes or invoke a conversion engine.
 
 ### `gcr_downloader/models.py`
 
-Defines small dataclasses or equivalent typed records:
+Defines dataclasses:
 
 - `Course`
 - `CourseFile`
@@ -88,7 +88,7 @@ Defines small dataclasses or equivalent typed records:
 - `ItemResult`
 - `DownloadReport`
 
-`DownloadOptions` contains course-state selection, video inclusion, Word conversion, PowerPoint conversion, and keep-originals behavior. `DownloadReport` serializes the same outcomes for both adapters.
+`DownloadOptions` contains video inclusion, Word conversion, PowerPoint conversion, and keep-originals behavior. Course-state filtering is a catalog input, not a download option. `DownloadReport` serializes the same outcomes for both adapters.
 
 ### Web Adapter
 
@@ -112,6 +112,7 @@ Delete `app/classroom.py` after moving its catalog behavior into shared package.
 - Terminal rendering.
 
 Move shared constants from `cli/constants.py` into shared package, then delete `cli/constants.py`.
+CLI-only token, index, and default-directory constants move into `cli/classroom_downloader.py`.
 
 ## Data Flow
 
@@ -130,6 +131,8 @@ Move shared constants from `cli/constants.py` into shared package, then delete `
 11. Request-scoped temporary resources close after response completion or disconnect.
 
 Web remains stateless between requests. It does not store downloaded IDs in cookies, browser storage, database, or server filesystem.
+The unused `download_scope=courses` branch is removed; `/download` accepts one course ID and selected file IDs from the file drawer.
+Each item uses an `8 MiB` in-memory spool threshold before spilling to request-scoped temporary storage. No item is registered in the archive until its download or conversion artifact is complete.
 
 ### CLI
 
@@ -157,7 +160,7 @@ Conversion applies to `.doc`, `.docx`, `.ppt`, and `.pptx` artifacts. This inclu
 - Request: one multipart `files` part per conversion call.
 - Success: HTTP `200`, non-empty body, PDF content type, and PDF signature.
 - Client errors: Gotenberg `4xx` is not retried.
-- Transient errors: timeout, connection failure, `5xx`, and `503` receive at most three attempts with bounded exponential backoff.
+- Transient errors: timeout, connection failure, `5xx`, and `503` receive three attempts with `1s` then `2s` backoff.
 - Failure: retain original artifact and record sanitized conversion error.
 
 When keep-originals is enabled, archive contains original and PDF with independently unique names. In replace mode, archive contains only verified PDF. Conversion failure overrides replace mode and includes original.
@@ -201,7 +204,7 @@ Statuses are:
 
 Web report is UTF-8 JSON with:
 
-- Version number.
+- Schema version `1`.
 - Summary counts by status.
 - Course name and source filename per item.
 - Final output paths.
@@ -220,12 +223,13 @@ Current deployment facts were verified on 2026-08-01 against official Gotenberg 
 - Configure web container dependency on Gotenberg.
 - Give Gotenberg HTTP startup probe `GET /health` on port `3000`.
 - Set `GOTENBERG_URL=http://localhost:3000` only on web container.
-- Start Gotenberg with `1 CPU / 1 GiB` and web with `1 CPU / 2 GiB` as initial limits.
+- Start Gotenberg with `1 CPU / 1 GiB` and web with `1 CPU / 2 GiB` as deployment baseline.
 - Set Cloud Run container concurrency to `1` because one Gotenberg LibreOffice process serializes conversions; scale service instances horizontally.
 - Set service request timeout to `900` seconds for multi-file preparation and transfer.
-- Use Gotenberg LibreOffice auto-start and bounded queue configuration so health and overload behavior are predictable.
+- Configure `LIBREOFFICE_AUTO_START=true`, `LIBREOFFICE_MAX_QUEUE_SIZE=1`, `LIBREOFFICE_START_TIMEOUT=60s`, and `API_TIMEOUT=120s` on Gotenberg.
+- Configure web Gotenberg client with `5s` connection timeout and `130s` response timeout.
 
-Add local Compose configuration with web and same pinned Gotenberg image. Production deployment uses committed Cloud Run multi-container configuration with explicit startup dependency and probe. OAuth/session secrets are injected only into web container.
+Add `compose.yaml` for local web plus same pinned Gotenberg image. Add `deploy/cloud-run-service.yaml` for production multi-container deployment with explicit startup dependency and probe. OAuth/session secrets are injected only into web container.
 
 Sources:
 
@@ -266,7 +270,7 @@ Sources:
 - Course enumeration failure returns `502` before ZIP response.
 - Video option excludes video and reports skip.
 - Gotenberg request uses correct route and multipart field.
-- Gotenberg `4xx` is not retried; transient failures are bounded.
+- Gotenberg `4xx` is not retried; transient failures use exactly three attempts.
 - Keep mode includes original and PDF.
 - Replace mode includes verified PDF only.
 - Conversion failure retains original and reports failure.
