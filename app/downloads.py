@@ -1,3 +1,4 @@
+import logging
 import pathlib
 
 from app.drive import DriveDownloadError, download_to_spool, get_metadata
@@ -5,6 +6,8 @@ from app.gotenberg import GotenbergError, convert_to_pdf
 from app.zipstreamer import ArchiveEntry
 from gcr_downloader.files import allocate_unique_name, conversion_kind, is_video_file, safe_filename
 from gcr_downloader.models import Course, CourseFile, DownloadOptions, DownloadReport, ItemResult
+
+logger = logging.getLogger(__name__)
 
 
 def prepare_download(
@@ -47,6 +50,7 @@ def prepare_download(
         try:
             pdf = convert_to_pdf(source, source_name)
         except GotenbergError:
+            logger.warning("Document conversion failed for %s", source_name, exc_info=True)
             source_path = allocate_unique_name(raw_source_path, used_paths)
             entries.append(ArchiveEntry(source_path, source))
             report.add(ItemResult(course.name, source_name, "conversion_failed", (source_path,), "Document conversion failed"))

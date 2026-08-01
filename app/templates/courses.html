@@ -180,7 +180,9 @@ const downloadFrame = document.getElementById("downloadFrame");
 const fileList = document.getElementById("fileList");
 
 function logToTerminal(m){
-  terminal.innerHTML+=`<p>> ${m}</p>`;
+  const line = document.createElement("p");
+  line.textContent = "> " + m;
+  terminal.append(line);
   terminal.scrollTop = terminal.scrollHeight;
 }
 
