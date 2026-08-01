@@ -1,5 +1,6 @@
 # OAuth & Secrets 
 credentials*.json
+gcr-downloader-credentials.json
 token*.json
 .env
 
