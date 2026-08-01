@@ -2,6 +2,7 @@ import json
 import pathlib
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -14,6 +15,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "cli"))
 
 import classroom_downloader as downloader
+
+from gcr_downloader.catalog import CatalogError
+from gcr_downloader.models import Course, CourseFile
 
 
 class FakeFiles:
@@ -56,6 +60,40 @@ class CliDownloaderTests(unittest.TestCase):
         except Exception as exc:
             self.fail(f"is_video_file raised {exc!r}")
         self.assertFalse(result)
+
+    def test_course_state_defaults_to_all(self):
+        with mock.patch.object(sys, "argv", ["classroom_downloader.py"]):
+            args = downloader.parse_args()
+        self.assertEqual(args.course_state, "all")
+
+    def test_course_state_accepts_archived(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["classroom_downloader.py", "--course-state", "archived"],
+        ):
+            args = downloader.parse_args()
+        self.assertEqual(args.course_state, "archived")
+
+    def test_course_selection_accepts_shared_course_records(self):
+        courses = [Course("1", "Active", "ACTIVE"), Course("2", "Archive", "ARCHIVED")]
+        with mock.patch("builtins.input", side_effect=["2", "y"]):
+            selected = downloader.select_courses(courses)
+        self.assertEqual(selected, [courses[1]])
+
+    def test_main_returns_nonzero_when_catalog_fails(self):
+        args = types.SimpleNamespace(
+            base_dir="downloads",
+            course_name_contains=None,
+            course_state="all",
+            dry_run=False,
+        )
+        with mock.patch.object(downloader, "parse_args", return_value=args), \
+             mock.patch.object(downloader, "get_credentials", return_value=object()), \
+             mock.patch.object(downloader, "build", side_effect=[object(), object()]), \
+             mock.patch.object(downloader, "load_index", return_value={}), \
+             mock.patch.object(downloader, "list_courses", side_effect=CatalogError("Failed to fetch courses")):
+            self.assertEqual(downloader.main(), 1)
 
     def test_failed_download_removes_partial_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -127,14 +165,14 @@ class CliDownloaderTests(unittest.TestCase):
                     return MetadataFiles()
 
             with mock.patch.object(
-                downloader, "list_course_files", return_value=[("second-id", "report.pdf")]
+                downloader, "list_course_files", return_value=[CourseFile("second-id", "report.pdf")]
             ), mock.patch.object(
                 downloader, "download_drive_file", return_value=True
             ) as download:
                 downloader.download_all_for_course(
                     object(),
                     MetadataDrive(),
-                    {"id": "course-id", "name": "Course"},
+                    Course("course-id", "Course", "ACTIVE"),
                     base_dir,
                     downloaded_ids,
                 )
@@ -164,14 +202,14 @@ class CliDownloaderTests(unittest.TestCase):
                     return MetadataFiles()
 
             with mock.patch.object(
-                downloader, "list_course_files", return_value=[("second-id", "report.pdf")]
+                downloader, "list_course_files", return_value=[CourseFile("second-id", "report.pdf")]
             ), mock.patch.object(
                 downloader, "download_drive_file", return_value=True
             ) as download:
                 downloader.download_all_for_course(
                     object(),
                     MetadataDrive(),
-                    {"id": "course-id", "name": "Course"},
+                    Course("course-id", "Course", "ACTIVE"),
                     base_dir,
                     downloaded_ids,
                 )

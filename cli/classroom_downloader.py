@@ -2,29 +2,39 @@ import os
 import io
 import json
 import pathlib
-import re
 import argparse
+import sys
 import time
 import shutil
 import subprocess
 import tempfile
 from typing import Dict, Set, List, Tuple
 
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from gcr_downloader.catalog import CatalogError, list_course_files, list_courses
+from gcr_downloader.files import (
+    GOOGLE_EXPORTS,
+    SCOPES,
+    ensure_extension,
+    is_video_file,
+    safe_filename,
+    validate_course_id,
+    validate_file_id,
+)
+from gcr_downloader.models import Course, CourseFile
+
+TOKEN_FILE = "token.json"
+INDEX_FILE = "download_index.json"
+DEFAULT_DOWNLOAD_DIR = "downloads"
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-
-from constants import (
-    SCOPES,
-    GOOGLE_DOC_EXPORTS,
-    TOKEN_FILE,
-    INDEX_FILE,
-    DEFAULT_DOWNLOAD_DIR,
-    VIDEO_EXTENSIONS,
-    VIDEO_MIME_PREFIXES,
-)
 
 
 # ---------- AUTH HELPERS ----------
@@ -56,48 +66,6 @@ def get_credentials() -> Credentials:
 
 
 # ---------- UTILS ----------
-
-
-def safe_filename(name: str) -> str:
-    """
-    Make a filesystem-safe, not-too-long filename from an arbitrary string.
-    Prevents path traversal by removing path separators.
-    """
-    if not name:
-        name = "unnamed"
-    # Remove path separators to prevent traversal
-    name = (
-        name.replace("../", "").replace("..\\", "").replace("/", "_").replace("\\", "_")
-    )
-    # Replace other bad chars
-    name = re.sub(r"[^\w.\- ]+", "_", name)
-    # Strip and limit length
-    name = name.strip()[:80]
-    if not name.strip(". "):
-        name = "file"
-    return name
-
-
-def validate_course_id(course_id: str) -> bool:
-    """
-    Validate that course_id is a valid Google Classroom course ID.
-    Course IDs are typically numeric strings.
-    """
-    if not course_id or not isinstance(course_id, str):
-        return False
-    # Allow alphanumeric, hyphens, and underscores only
-    return bool(re.match(r"^[a-zA-Z0-9\-_]+$", course_id))
-
-
-def validate_file_id(file_id: str) -> bool:
-    """
-    Validate that file_id is a valid Google Drive file ID.
-    File IDs are alphanumeric strings with hyphens and underscores.
-    """
-    if not file_id or not isinstance(file_id, str):
-        return False
-    # Allow alphanumeric, hyphens, and underscores only
-    return bool(re.match(r"^[a-zA-Z0-9\-_]+$", file_id))
 
 
 def load_index() -> Dict[str, str]:
@@ -146,83 +114,6 @@ def get_indexed_path(base_dir: pathlib.Path, stored_path: str) -> pathlib.Path |
 # ---------- CLASSROOM HELPERS ----------
 
 
-def list_all_courses(classroom_service, name_contains: str = None) -> List[Dict]:
-    """
-    List all courses the user is enrolled in. Optionally filter by name substring.
-    """
-    courses: List[Dict] = []
-    page_token = None
-
-    while True:
-        resp = classroom_service.courses().list(pageToken=page_token).execute()
-        cs = resp.get("courses", [])
-        for c in cs:
-            if name_contains:
-                if name_contains.lower() in c.get("name", "").lower():
-                    courses.append(c)
-            else:
-                courses.append(c)
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-
-    return courses
-
-
-def list_course_files(classroom_service, course_id: str) -> List[Tuple[str, str]]:
-    """
-    For a given course, return list of (drive_file_id, name_hint).
-    Combines CourseWork (assignments) and CourseWorkMaterials.
-    """
-    files: List[Tuple[str, str]] = []
-
-    # ---- Coursework (assignments, quizzes etc.) ----
-    cw_page_token = None
-    while True:
-        cw_resp = (
-            classroom_service.courses()
-            .courseWork()
-            .list(courseId=course_id, pageToken=cw_page_token)
-            .execute()
-        )
-        for cw in cw_resp.get("courseWork", []):
-            title = cw.get("title", "Assignment")
-            for mat in cw.get("materials", []):
-                df = mat.get("driveFile")
-                if df and "driveFile" in df:
-                    inner = df["driveFile"]
-                    file_id = inner.get("id")
-                    if file_id:
-                        files.append((file_id, inner.get("title", title)))
-        cw_page_token = cw_resp.get("nextPageToken")
-        if not cw_page_token:
-            break
-
-    # ---- Coursework materials (non-graded posts) ----
-    m_page_token = None
-    while True:
-        m_resp = (
-            classroom_service.courses()
-            .courseWorkMaterials()
-            .list(courseId=course_id, pageToken=m_page_token)
-            .execute()
-        )
-        for m in m_resp.get("courseWorkMaterial", []):
-            title = m.get("title", "Material")
-            for mat in m.get("materials", []):
-                df = mat.get("driveFile")
-                if df and "driveFile" in df:
-                    inner = df["driveFile"]
-                    file_id = inner.get("id")
-                    if file_id:
-                        files.append((file_id, inner.get("title", title)))
-        m_page_token = m_resp.get("nextPageToken")
-        if not m_page_token:
-            break
-
-    return files
-
-
 # ---------- DRIVE DOWNLOAD HELPERS ----------
 
 
@@ -248,8 +139,8 @@ def download_drive_file(
     for attempt in range(max_retries):
         temp_path = None
         try:
-            if mime_type in GOOGLE_DOC_EXPORTS:
-                export_mime, _ext = GOOGLE_DOC_EXPORTS[mime_type]
+            if mime_type in GOOGLE_EXPORTS:
+                export_mime, _ext = GOOGLE_EXPORTS[mime_type]
                 request = drive_service.files().export_media(
                     fileId=file_id, mimeType=export_mime
                 )
@@ -286,30 +177,6 @@ def download_drive_file(
             else:
                 print(f"Failed to download {file_id} after {max_retries} attempts: {e}")
                 return False
-
-
-def is_video_file(name: str, mime_type: str | None) -> bool:
-    """
-    Check if a file is a video based on its name extension or MIME type.
-    """
-    ext = pathlib.Path(name).suffix.lower()
-    if ext in VIDEO_EXTENSIONS:
-        return True
-    if mime_type and mime_type.startswith(VIDEO_MIME_PREFIXES):
-        return True
-    return False
-
-
-def ensure_extension(name: str, mime_type: str | None) -> str:
-    """
-    For Google Docs/Slides/Sheets, add a sensible extension when exporting.
-    For other mimetypes, keep the original name.
-    """
-    if mime_type in GOOGLE_DOC_EXPORTS:
-        export_mime, ext = GOOGLE_DOC_EXPORTS[mime_type]
-        if not name.lower().endswith(ext):
-            name = name + ext
-    return name
 
 
 def get_unique_path(dest_path: pathlib.Path) -> pathlib.Path:
@@ -489,13 +356,13 @@ def convert_downloaded_files(
 def download_all_for_course(
     classroom_service,
     drive_service,
-    course: Dict,
+    course: Course,
     base_dir: pathlib.Path,
     downloaded_ids: Dict[str, str],
     dry_run: bool = False,
     download_videos: bool = True,
 ) -> None:
-    course_id = course.get("id", "")
+    course_id = course.id
 
     # Validate course ID before processing
     if not validate_course_id(course_id):
@@ -503,7 +370,7 @@ def download_all_for_course(
         return
 
     base_path = base_dir.resolve()
-    course_name = course.get("name", f"course_{course_id}")
+    course_name = course.name
     course_dir = base_path / safe_filename(course_name)
 
     print(f"\n=== Course: {course_name} (id={course_id}) ===")
@@ -511,7 +378,9 @@ def download_all_for_course(
     files = list_course_files(classroom_service, course_id)
     print(f"Found {len(files)} attached Drive files in this course.")
 
-    for file_id, name_hint in files:
+    for course_file in files:
+        file_id = course_file.id
+        name_hint = course_file.title_hint
         # Validate file ID before processing
         if not validate_file_id(file_id):
             print(f"Warning: Invalid file ID format: {file_id}. Skipping.")
@@ -578,6 +447,12 @@ def parse_args():
         help="If set, only download from courses whose name contains this substring (case-insensitive).",
     )
     parser.add_argument(
+        "--course-state",
+        choices=("active", "archived", "all"),
+        default="all",
+        help="Filter courses by state (default: all).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="List what would be downloaded, but do not actually download.",
@@ -585,7 +460,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def select_courses(courses: List[Dict]) -> List[Dict]:
+def select_courses(courses: List[Course]) -> List[Course]:
     """
     Display list of courses and let user select which ones to download from.
     """
@@ -597,8 +472,7 @@ def select_courses(courses: List[Dict]) -> List[Dict]:
     print("=" * 50)
 
     for idx, course in enumerate(courses, 1):
-        course_name = course.get("name", f"Unnamed Course (ID: {course.get('id')})")
-        print(f"  {idx}. {course_name}")
+        print(f"  {idx}. {course.name}")
 
     print("=" * 50)
     print("\nSelection options:")
@@ -657,7 +531,7 @@ def select_courses(courses: List[Dict]) -> List[Dict]:
                 selected_courses = [courses[i - 1] for i in sorted(selected_indices)]
                 print(f"\nSelected {len(selected_courses)} course(s):")
                 for c in selected_courses:
-                    print(f"  - {c.get('name', 'Unnamed')}")
+                    print(f"  - {c.name}")
                 confirm = input("\nProceed with download? (y/n): ").strip().lower()
                 if confirm in ("y", "yes"):
                     return selected_courses
@@ -667,7 +541,7 @@ def select_courses(courses: List[Dict]) -> List[Dict]:
                 print("  No valid courses selected. Please try again.")
 
 
-def main():
+def main() -> int:
     args = parse_args()
     base_dir = pathlib.Path(args.base_dir)
 
@@ -680,11 +554,19 @@ def main():
     downloaded_ids = load_index()
 
     print("Fetching courses...")
-    courses = list_all_courses(classroom_service, args.course_name_contains)
+    try:
+        courses = list_courses(
+            classroom_service,
+            state=args.course_state,
+            name_contains=args.course_name_contains,
+        )
+    except CatalogError as exc:
+        print(str(exc))
+        return 1
 
     if not courses:
         print("No courses found that match your filter.")
-        return
+        return 0
 
     print(f"Found {len(courses)} course(s).")
 
@@ -693,7 +575,7 @@ def main():
 
     if not selected_courses:
         print("No courses selected. Exiting.")
-        return
+        return 0
 
     conversion_prefs = get_conversion_preferences()
     download_videos = get_video_preference()
@@ -736,6 +618,8 @@ def main():
     else:
         print("\nDry run completed. No files were actually downloaded.")
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
