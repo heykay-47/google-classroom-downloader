@@ -1,5 +1,4 @@
 import pathlib
-import tempfile
 import unittest
 
 from deploy.render_cloud_run import render_service

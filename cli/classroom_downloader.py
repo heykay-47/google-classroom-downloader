@@ -25,7 +25,6 @@ from gcr_downloader.files import (
 )
 from gcr_downloader.models import (
     Course,
-    CourseFile,
     DownloadOptions,
     DownloadReport,
     ItemResult,
