@@ -34,3 +34,6 @@ google-cloud-sdk/
 
 # Private runtime indexes 
 download_index.json
+
+# Git worktrees
+.worktrees/

@@ -1,7 +1,7 @@
 # App and CLI Feature Parity Design
 
 **Date:** 2026-08-01
-**Status:** Design approved; awaiting written-spec review
+**Status:** Approved
 
 ## Context
 
