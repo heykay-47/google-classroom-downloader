@@ -1,6 +1,11 @@
 import unittest
 from unittest import mock
 
+from test_support import install_dependency_stubs
+
+
+install_dependency_stubs()
+
 from app import downloads
 from app.drive import DriveMetadata
 from cli import classroom_downloader as cli
