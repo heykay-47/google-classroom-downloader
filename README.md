@@ -1,5 +1,7 @@
 # Google Classroom Auto File Downloader
 
+Fork of [Evani Menon's original project](https://github.com/evanimenon/google-classroom-downloader), published under the MIT License. This fork adds stronger filename and path handling, atomic downloads, safer Drive export and PDF conversion, resilient MIME handling, regression tests, and an improved web download flow.
+
 ### NOTE: I am currently developing a web version of this for easier access for people who prefer not to run scripts locally. The web version is on hold while I wait for Google OAuth verification. Please stay tuned and thank you for the patience.
 
 
@@ -45,7 +47,7 @@ google-classroom-downloader/
 ### 1. Clone this repository
 
 ```bash
-git clone https://github.com/evanimenon/google-classroom-downloader.git
+git clone https://github.com/heykay-47/google-classroom-downloader.git
 cd google-classroom-downloader/cli
 ````
 
