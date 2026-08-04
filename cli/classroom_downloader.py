@@ -2,29 +2,44 @@ import os
 import io
 import json
 import pathlib
-import re
 import argparse
+import sys
 import time
 import shutil
 import subprocess
 import tempfile
-from typing import Dict, Set, List, Tuple
+from typing import Dict, List, Tuple
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from gcr_downloader.catalog import CatalogError, list_course_files, list_courses
+from gcr_downloader.files import (
+    GOOGLE_EXPORTS,
+    SCOPES,
+    allocate_unique_name,
+    conversion_kind,
+    ensure_extension,
+    is_video_file,
+    safe_filename,
+)
+from gcr_downloader.models import (
+    Course,
+    DownloadOptions,
+    DownloadReport,
+    ItemResult,
+)
+
+TOKEN_FILE = "token.json"
+INDEX_FILE = "download_index.json"
+DEFAULT_DOWNLOAD_DIR = "downloads"
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-
-from constants import (
-    SCOPES,
-    GOOGLE_DOC_EXPORTS,
-    TOKEN_FILE,
-    INDEX_FILE,
-    DEFAULT_DOWNLOAD_DIR,
-    VIDEO_EXTENSIONS,
-    VIDEO_MIME_PREFIXES,
-)
 
 
 # ---------- AUTH HELPERS ----------
@@ -56,48 +71,6 @@ def get_credentials() -> Credentials:
 
 
 # ---------- UTILS ----------
-
-
-def safe_filename(name: str) -> str:
-    """
-    Make a filesystem-safe, not-too-long filename from an arbitrary string.
-    Prevents path traversal by removing path separators.
-    """
-    if not name:
-        name = "unnamed"
-    # Remove path separators to prevent traversal
-    name = (
-        name.replace("../", "").replace("..\\", "").replace("/", "_").replace("\\", "_")
-    )
-    # Replace other bad chars
-    name = re.sub(r"[^\w.\- ]+", "_", name)
-    # Strip and limit length
-    name = name.strip()[:80]
-    if not name.strip(". "):
-        name = "file"
-    return name
-
-
-def validate_course_id(course_id: str) -> bool:
-    """
-    Validate that course_id is a valid Google Classroom course ID.
-    Course IDs are typically numeric strings.
-    """
-    if not course_id or not isinstance(course_id, str):
-        return False
-    # Allow alphanumeric, hyphens, and underscores only
-    return bool(re.match(r"^[a-zA-Z0-9\-_]+$", course_id))
-
-
-def validate_file_id(file_id: str) -> bool:
-    """
-    Validate that file_id is a valid Google Drive file ID.
-    File IDs are alphanumeric strings with hyphens and underscores.
-    """
-    if not file_id or not isinstance(file_id, str):
-        return False
-    # Allow alphanumeric, hyphens, and underscores only
-    return bool(re.match(r"^[a-zA-Z0-9\-_]+$", file_id))
 
 
 def load_index() -> Dict[str, str]:
@@ -146,83 +119,6 @@ def get_indexed_path(base_dir: pathlib.Path, stored_path: str) -> pathlib.Path |
 # ---------- CLASSROOM HELPERS ----------
 
 
-def list_all_courses(classroom_service, name_contains: str = None) -> List[Dict]:
-    """
-    List all courses the user is enrolled in. Optionally filter by name substring.
-    """
-    courses: List[Dict] = []
-    page_token = None
-
-    while True:
-        resp = classroom_service.courses().list(pageToken=page_token).execute()
-        cs = resp.get("courses", [])
-        for c in cs:
-            if name_contains:
-                if name_contains.lower() in c.get("name", "").lower():
-                    courses.append(c)
-            else:
-                courses.append(c)
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-
-    return courses
-
-
-def list_course_files(classroom_service, course_id: str) -> List[Tuple[str, str]]:
-    """
-    For a given course, return list of (drive_file_id, name_hint).
-    Combines CourseWork (assignments) and CourseWorkMaterials.
-    """
-    files: List[Tuple[str, str]] = []
-
-    # ---- Coursework (assignments, quizzes etc.) ----
-    cw_page_token = None
-    while True:
-        cw_resp = (
-            classroom_service.courses()
-            .courseWork()
-            .list(courseId=course_id, pageToken=cw_page_token)
-            .execute()
-        )
-        for cw in cw_resp.get("courseWork", []):
-            title = cw.get("title", "Assignment")
-            for mat in cw.get("materials", []):
-                df = mat.get("driveFile")
-                if df and "driveFile" in df:
-                    inner = df["driveFile"]
-                    file_id = inner.get("id")
-                    if file_id:
-                        files.append((file_id, inner.get("title", title)))
-        cw_page_token = cw_resp.get("nextPageToken")
-        if not cw_page_token:
-            break
-
-    # ---- Coursework materials (non-graded posts) ----
-    m_page_token = None
-    while True:
-        m_resp = (
-            classroom_service.courses()
-            .courseWorkMaterials()
-            .list(courseId=course_id, pageToken=m_page_token)
-            .execute()
-        )
-        for m in m_resp.get("courseWorkMaterial", []):
-            title = m.get("title", "Material")
-            for mat in m.get("materials", []):
-                df = mat.get("driveFile")
-                if df and "driveFile" in df:
-                    inner = df["driveFile"]
-                    file_id = inner.get("id")
-                    if file_id:
-                        files.append((file_id, inner.get("title", title)))
-        m_page_token = m_resp.get("nextPageToken")
-        if not m_page_token:
-            break
-
-    return files
-
-
 # ---------- DRIVE DOWNLOAD HELPERS ----------
 
 
@@ -248,8 +144,8 @@ def download_drive_file(
     for attempt in range(max_retries):
         temp_path = None
         try:
-            if mime_type in GOOGLE_DOC_EXPORTS:
-                export_mime, _ext = GOOGLE_DOC_EXPORTS[mime_type]
+            if mime_type in GOOGLE_EXPORTS:
+                export_mime, _ext = GOOGLE_EXPORTS[mime_type]
                 request = drive_service.files().export_media(
                     fileId=file_id, mimeType=export_mime
                 )
@@ -288,49 +184,16 @@ def download_drive_file(
                 return False
 
 
-def is_video_file(name: str, mime_type: str | None) -> bool:
-    """
-    Check if a file is a video based on its name extension or MIME type.
-    """
-    ext = pathlib.Path(name).suffix.lower()
-    if ext in VIDEO_EXTENSIONS:
-        return True
-    if mime_type and mime_type.startswith(VIDEO_MIME_PREFIXES):
-        return True
-    return False
-
-
-def ensure_extension(name: str, mime_type: str | None) -> str:
-    """
-    For Google Docs/Slides/Sheets, add a sensible extension when exporting.
-    For other mimetypes, keep the original name.
-    """
-    if mime_type in GOOGLE_DOC_EXPORTS:
-        export_mime, ext = GOOGLE_DOC_EXPORTS[mime_type]
-        if not name.lower().endswith(ext):
-            name = name + ext
-    return name
-
-
 def get_unique_path(dest_path: pathlib.Path) -> pathlib.Path:
     """
     If dest_path already exists, append a numeric suffix to make it unique.
     e.g., report.pdf -> report_1.pdf -> report_2.pdf
     """
-    if not dest_path.exists():
-        return dest_path
-
-    stem = dest_path.stem
-    suffix = dest_path.suffix
-    parent = dest_path.parent
-    counter = 1
-
+    used_names = {path.name for path in dest_path.parent.iterdir()} if dest_path.parent.exists() else set()
     while True:
-        new_name = f"{stem}_{counter}{suffix}"
-        new_path = parent / new_name
-        if not new_path.exists():
-            return new_path
-        counter += 1
+        candidate = dest_path.with_name(allocate_unique_name(dest_path.name, used_names))
+        if not candidate.exists():
+            return candidate
 
 
 # ---------- CONVERSION HELPERS ----------
@@ -389,98 +252,34 @@ def check_libreoffice_available() -> Tuple[bool, str]:
     return False, ""
 
 
-def convert_to_pdf(
-    file_path: pathlib.Path,
-    libreoffice_cmd: str,
-    delete_original: bool = False,
-) -> bool:
+def convert_to_pdf(file_path: pathlib.Path, libreoffice_cmd: str) -> tuple[pathlib.Path | None, str]:
     pdf_path = file_path.with_suffix(".pdf")
     if pdf_path.exists():
-        print(f"PDF already exists, skipping conversion: {pdf_path}")
-        return True
-
+        return None, "PDF destination already exists"
     try:
         subprocess.run(
-            [
-                libreoffice_cmd,
-                "--headless",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                str(file_path.parent),
-                str(file_path),
-            ],
+            [libreoffice_cmd, "--headless", "--convert-to", "pdf", "--outdir", str(file_path.parent), str(file_path)],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
     except FileNotFoundError:
-        print("LibreOffice not found. Skipping conversion.")
-        return False
-    except subprocess.CalledProcessError as exc:
-        error_msg = exc.stderr.strip() or str(exc)
-        print(f"Failed to convert {file_path} to PDF: {error_msg}")
-        return False
-
-    if not pdf_path.exists():
-        print(f"Conversion did not produce PDF for: {file_path}")
-        return False
-
-    print(f"Converted to PDF: {pdf_path}")
-
-    if delete_original:
-        try:
-            file_path.unlink()
-            print(f"Deleted original: {file_path}")
-        except OSError as exc:
-            print(f"Failed to delete original {file_path}: {exc}")
-
-    return True
+        return None, "LibreOffice not found"
+    except subprocess.CalledProcessError:
+        return None, "LibreOffice conversion failed"
+    if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+        return None, "Conversion did not produce a non-empty PDF"
+    return pdf_path, ""
 
 
-def convert_downloaded_files(
-    base_dir: pathlib.Path,
-    convert_ppt: bool,
-    convert_docx: bool,
-    delete_originals: bool,
-    libreoffice_cmd: str,
-    downloaded_ids: Dict[str, str],
-) -> None:
-    extensions: Set[str] = set()
-    if convert_ppt:
-        extensions.update({".ppt", ".pptx"})
-    if convert_docx:
-        extensions.update({".doc", ".docx"})
-
-    if not extensions:
-        return
-
-    print("\nConverting documents to PDF...")
-    files = [
-        path
-        for path in base_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() in extensions
-    ]
-
-    if not files:
-        print("No matching files found for conversion.")
-        return
-
-    for file_path in files:
-        converted = convert_to_pdf(
-            file_path,
-            libreoffice_cmd,
-            delete_original=delete_originals,
-        )
-        pdf_path = file_path.with_suffix(".pdf")
-        if not converted or file_path.exists() or not pdf_path.exists():
-            continue
-
-        source_path = file_path.resolve()
-        for file_id, stored_path in downloaded_ids.items():
-            if get_indexed_path(base_dir, stored_path) == source_path:
-                downloaded_ids[file_id] = str(pdf_path.resolve().relative_to(base_dir.resolve()))
+def render_report(report: DownloadReport) -> None:
+    print("\nDownload summary:")
+    for status, count in sorted(report.summary().items()):
+        print(f"  {status}: {count}")
+    for item in report.items:
+        if item.status.startswith("skipped_") or item.status.endswith("_failed"):
+            print(f"  {item.source_name}: {item.message}")
 
 
 # ---------- CORE LOGIC ----------
@@ -489,75 +288,91 @@ def convert_downloaded_files(
 def download_all_for_course(
     classroom_service,
     drive_service,
-    course: Dict,
+    course: Course,
     base_dir: pathlib.Path,
     downloaded_ids: Dict[str, str],
+    options: DownloadOptions,
+    report: DownloadReport,
+    libreoffice_cmd: str = "",
     dry_run: bool = False,
-    download_videos: bool = True,
 ) -> None:
-    course_id = course.get("id", "")
-
-    # Validate course ID before processing
-    if not validate_course_id(course_id):
-        print(f"Warning: Invalid course ID format: {course_id}. Skipping.")
-        return
-
     base_path = base_dir.resolve()
-    course_name = course.get("name", f"course_{course_id}")
-    course_dir = base_path / safe_filename(course_name)
-
-    print(f"\n=== Course: {course_name} (id={course_id}) ===")
-
-    files = list_course_files(classroom_service, course_id)
-    print(f"Found {len(files)} attached Drive files in this course.")
-
-    for file_id, name_hint in files:
-        # Validate file ID before processing
-        if not validate_file_id(file_id):
-            print(f"Warning: Invalid file ID format: {file_id}. Skipping.")
-            continue
-
-        # Get metadata from Drive
-        try:
-            meta = (
-                drive_service.files()
-                .get(
-                    fileId=file_id,
+    course_dir = base_path / safe_filename(course.name)
+    for course_file in list_course_files(classroom_service, course.id):
+        metadata = None
+        for attempt in range(3):
+            try:
+                metadata = drive_service.files().get(
+                    fileId=course_file.id,
                     fields="name,mimeType",
-                )
-                .execute()
-            )
-        except Exception as e:
-            print(f"Error fetching metadata for file {file_id}: {e}")
+                ).execute()
+                break
+            except Exception:
+                if attempt < 2:
+                    time.sleep(2**attempt)
+        if metadata is None:
+            report.add(ItemResult(course.name, course_file.title_hint, "download_failed", message="Failed to fetch file metadata"))
             continue
 
-        fname = meta.get("name") or name_hint or file_id
-        mime_type = meta.get("mimeType")
-
-        fname = safe_filename(fname)
-        fname = ensure_extension(fname, mime_type)
-
-        if not download_videos and is_video_file(fname, mime_type):
-            print(f"Skipping video file: {fname}")
-            continue
-
-        dest_path = course_dir / fname
-        if file_id in downloaded_ids:
-            indexed_path = get_indexed_path(base_path, downloaded_ids[file_id])
-            if indexed_path is not None and indexed_path.exists():
-                print(f"File already exists locally, skipping: {indexed_path}")
-                downloaded_ids[file_id] = str(indexed_path.relative_to(base_path))
-                continue
-            downloaded_ids.pop(file_id)
-
-        # Handle duplicate filenames from different files
-        dest_path = get_unique_path(dest_path)
-
-        success = download_drive_file(
-            drive_service, file_id, dest_path, mime_type, dry_run=dry_run
+        source_name = ensure_extension(
+            safe_filename(metadata.get("name") or course_file.title_hint),
+            metadata.get("mimeType"),
         )
-        if success or dry_run:
-            downloaded_ids[file_id] = str(dest_path.relative_to(base_path))
+        if not options.include_videos and is_video_file(source_name, metadata.get("mimeType")):
+            report.add(ItemResult(course.name, source_name, "skipped_video", message="Video excluded"))
+            continue
+
+        indexed_path = get_indexed_path(base_path, downloaded_ids.get(course_file.id, ""))
+        if indexed_path is not None and indexed_path.exists():
+            relative = indexed_path.relative_to(base_path).as_posix()
+            downloaded_ids[course_file.id] = relative
+            report.add(ItemResult(course.name, source_name, "skipped_existing", (relative,), "File already exists"))
+            continue
+        downloaded_ids.pop(course_file.id, None)
+
+        destination = get_unique_path(course_dir / source_name)
+        relative_destination = destination.relative_to(base_path).as_posix()
+        if dry_run:
+            download_drive_file(
+                drive_service,
+                course_file.id,
+                destination,
+                metadata.get("mimeType"),
+                dry_run=True,
+            )
+            report.add(ItemResult(course.name, source_name, "dry_run", (relative_destination,)))
+            continue
+
+        if not download_drive_file(
+            drive_service,
+            course_file.id,
+            destination,
+            metadata.get("mimeType"),
+        ):
+            report.add(ItemResult(course.name, source_name, "download_failed", message="Download failed after three attempts"))
+            continue
+
+        downloaded_ids[course_file.id] = relative_destination
+        if conversion_kind(source_name, options) is None:
+            report.add(ItemResult(course.name, source_name, "downloaded", (relative_destination,)))
+            continue
+
+        pdf_path, error = convert_to_pdf(destination, libreoffice_cmd)
+        if pdf_path is None:
+            report.add(ItemResult(course.name, source_name, "conversion_failed", (relative_destination,), error))
+            continue
+
+        relative_pdf = pdf_path.relative_to(base_path).as_posix()
+        outputs = (relative_destination, relative_pdf)
+        if not options.keep_originals:
+            try:
+                destination.unlink()
+            except OSError:
+                report.add(ItemResult(course.name, source_name, "conversion_failed", outputs, "Converted PDF created but original could not be removed"))
+                continue
+            downloaded_ids[course_file.id] = relative_pdf
+            outputs = (relative_pdf,)
+        report.add(ItemResult(course.name, source_name, "converted", outputs))
 
 
 # ---------- MAIN / CLI ----------
@@ -578,6 +393,12 @@ def parse_args():
         help="If set, only download from courses whose name contains this substring (case-insensitive).",
     )
     parser.add_argument(
+        "--course-state",
+        choices=("active", "archived", "all"),
+        default="all",
+        help="Filter courses by state (default: all).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="List what would be downloaded, but do not actually download.",
@@ -585,7 +406,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def select_courses(courses: List[Dict]) -> List[Dict]:
+def select_courses(courses: List[Course]) -> List[Course]:
     """
     Display list of courses and let user select which ones to download from.
     """
@@ -597,8 +418,7 @@ def select_courses(courses: List[Dict]) -> List[Dict]:
     print("=" * 50)
 
     for idx, course in enumerate(courses, 1):
-        course_name = course.get("name", f"Unnamed Course (ID: {course.get('id')})")
-        print(f"  {idx}. {course_name}")
+        print(f"  {idx}. {course.name}")
 
     print("=" * 50)
     print("\nSelection options:")
@@ -657,7 +477,7 @@ def select_courses(courses: List[Dict]) -> List[Dict]:
                 selected_courses = [courses[i - 1] for i in sorted(selected_indices)]
                 print(f"\nSelected {len(selected_courses)} course(s):")
                 for c in selected_courses:
-                    print(f"  - {c.get('name', 'Unnamed')}")
+                    print(f"  - {c.name}")
                 confirm = input("\nProceed with download? (y/n): ").strip().lower()
                 if confirm in ("y", "yes"):
                     return selected_courses
@@ -667,7 +487,7 @@ def select_courses(courses: List[Dict]) -> List[Dict]:
                 print("  No valid courses selected. Please try again.")
 
 
-def main():
+def main() -> int:
     args = parse_args()
     base_dir = pathlib.Path(args.base_dir)
 
@@ -680,11 +500,19 @@ def main():
     downloaded_ids = load_index()
 
     print("Fetching courses...")
-    courses = list_all_courses(classroom_service, args.course_name_contains)
+    try:
+        courses = list_courses(
+            classroom_service,
+            state=args.course_state,
+            name_contains=args.course_name_contains,
+        )
+    except CatalogError as exc:
+        print(str(exc))
+        return 1
 
     if not courses:
         print("No courses found that match your filter.")
-        return
+        return 0
 
     print(f"Found {len(courses)} course(s).")
 
@@ -693,10 +521,9 @@ def main():
 
     if not selected_courses:
         print("No courses selected. Exiting.")
-        return
+        return 0
 
     conversion_prefs = get_conversion_preferences()
-    download_videos = get_video_preference()
     libreoffice_cmd = ""
     if conversion_prefs["convert_ppt"] or conversion_prefs["convert_docx"]:
         available, libreoffice_cmd = check_libreoffice_available()
@@ -706,36 +533,36 @@ def main():
             conversion_prefs["convert_docx"] = False
             conversion_prefs["delete_originals"] = False
 
-    for c in selected_courses:
-        download_all_for_course(
-            classroom_service,
-            drive_service,
-            c,
-            base_dir,
-            downloaded_ids,
-            dry_run=args.dry_run,
-            download_videos=download_videos,
-        )
+    options = DownloadOptions(
+        include_videos=get_video_preference(),
+        convert_word=conversion_prefs["convert_docx"],
+        convert_powerpoint=conversion_prefs["convert_ppt"],
+        keep_originals=not conversion_prefs["delete_originals"],
+    )
+    report = DownloadReport()
 
-    if not args.dry_run and (
-        conversion_prefs["convert_ppt"] or conversion_prefs["convert_docx"]
-    ):
-        convert_downloaded_files(
-            base_dir=base_dir,
-            convert_ppt=conversion_prefs["convert_ppt"],
-            convert_docx=conversion_prefs["convert_docx"],
-            delete_originals=conversion_prefs["delete_originals"],
-            libreoffice_cmd=libreoffice_cmd,
-            downloaded_ids=downloaded_ids,
-        )
+    try:
+        for course in selected_courses:
+            download_all_for_course(
+                classroom_service,
+                drive_service,
+                course,
+                base_dir,
+                downloaded_ids,
+                options,
+                report,
+                libreoffice_cmd=libreoffice_cmd,
+                dry_run=args.dry_run,
+            )
+    except CatalogError as exc:
+        print(str(exc))
+        return 1
 
     if not args.dry_run:
-        print("\nSaving download index...")
         save_index(downloaded_ids)
-        print("Done. All new files downloaded.")
-    else:
-        print("\nDry run completed. No files were actually downloaded.")
+    render_report(report)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

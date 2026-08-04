@@ -47,6 +47,11 @@ body {
     <p class="text-sm text-gray-500">Search and download course materials in bulk.</p>
   </div>
   <div class="flex items-center gap-3">
+    <div id="courseStateFilters" class="flex rounded-xl border border-gray-200 bg-white p-1 text-xs font-semibold">
+      <button type="button" data-state-filter="all" class="state-filter rounded-lg bg-emerald-100 px-3 py-2 text-emerald-700">All</button>
+      <button type="button" data-state-filter="active" class="state-filter rounded-lg px-3 py-2 text-gray-500">Active</button>
+      <button type="button" data-state-filter="archived" class="state-filter rounded-lg px-3 py-2 text-gray-500">Archived</button>
+    </div>
     <div class="relative">
       <input id="courseSearch" type="text" placeholder="Search courses"
         class="w-72 rounded-xl border border-gray-200 bg-white px-4 py-2 text-sm focus:border-emerald-500 focus:outline-none">
@@ -83,25 +88,25 @@ body {
 <section id="courseGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
 {% for c in courses %}
 <div class="course-card bg-white/90 border rounded-xl p-5 shadow-sm hover:shadow-md transition flex flex-col justify-between"
-  data-course-name="{{ c.name|lower }}" data-course-id="{{ c.id }}">
+  data-course-name="{{ c.name|lower }}" data-course-id="{{ c.id }}" data-course-state="{{ c.state|lower }}">
   <div>
     <div class="flex items-start justify-between gap-3">
       <div>
         <h3 class="font-bold text-lg mb-1">{{ c.name }}</h3>
         <span class="inline-block text-xs px-3 py-1 rounded-full
-      {% if c.courseState == 'ACTIVE' %}
+      {% if c.state == 'ACTIVE' %}
       bg-emerald-100 text-emerald-700
       {% else %}
       bg-gray-200 text-gray-500
       {% endif %}">
-      {{ c.courseState }}
+      {{ c.state }}
     </span>
       </div>
       <span class="file-count text-xs font-semibold text-gray-400" data-course-id="{{ c.id }}">--</span>
     </div>
   </div>
-  <button onclick="openDrawer('{{ c.id }}','{{ c.name }}')"
-    class="mt-5 py-2 rounded-lg bg-emerald-50 text-emerald-700 hover:bg-emerald-100 transition">
+  <button type="button" data-manage-files data-course-id="{{ c.id }}" data-course-name="{{ c.name }}"
+    class="mt-5 rounded-lg bg-emerald-50 py-2 text-emerald-700 hover:bg-emerald-100">
     Manage Files
   </button>
 </div>
@@ -133,8 +138,7 @@ body {
 </div>
 
 <form action="/download" method="post" class="flex flex-col flex-1 min-h-0">
-<input type="hidden" name="course_ids" id="activeCourseId">
-<input type="hidden" name="download_scope" value="files">
+<input type="hidden" name="course_id" id="activeCourseId">
 
 <div class="px-6 pt-5 flex items-center justify-between text-xs text-gray-500">
   <span>Quick actions</span>
@@ -143,6 +147,14 @@ body {
     <button type="button" onclick="toggleAllFiles(false)" class="rounded-lg border border-gray-200 px-3 py-1">Clear</button>
   </div>
 </div>
+
+<fieldset class="shrink-0 space-y-3 border-t p-6 text-sm">
+  <legend class="font-semibold text-gray-700">Download options</legend>
+  <label class="flex items-center gap-2"><input type="checkbox" name="skip_videos" value="true"> Skip video files</label>
+  <label class="flex items-center gap-2"><input id="convertWord" type="checkbox" name="convert_word" value="true"> Convert Word files to PDF</label>
+  <label class="flex items-center gap-2"><input id="convertPowerPoint" type="checkbox" name="convert_powerpoint" value="true"> Convert PowerPoint files to PDF</label>
+  <label class="flex items-center gap-2"><input id="replaceOriginals" type="checkbox" name="replace_originals" value="true" disabled> Replace originals after successful conversion</label>
+</fieldset>
 
 <div id="fileList" class="flex-1 overflow-y-auto p-6 space-y-3 text-sm text-gray-700"></div>
 
@@ -165,9 +177,12 @@ const courseCount = document.getElementById("courseCount");
 const errorBanner = document.getElementById("errorBanner");
 const downloadForm = document.querySelector("form[action='/download']");
 const downloadFrame = document.getElementById("downloadFrame");
+const fileList = document.getElementById("fileList");
 
 function logToTerminal(m){
-  terminal.innerHTML+=`<p>> ${m}</p>`;
+  const line = document.createElement("p");
+  line.textContent = "> " + m;
+  terminal.append(line);
   terminal.scrollTop = terminal.scrollHeight;
 }
 
@@ -180,7 +195,7 @@ function showError(message){
 async function openDrawer(id,name){
   document.getElementById("drawerTitle").innerText=name;
   document.getElementById("activeCourseId").value=id;
-  document.getElementById("fileList").innerHTML="<p class='text-center text-gray-400'>Loading...</p>";
+  fileList.innerHTML="<p class='text-center text-gray-400'>Loading...</p>";
   document.getElementById("drawer").classList.remove("translate-x-full");
   document.getElementById("drawerOverlay").classList.remove("hidden");
   logToTerminal("Opening course: "+name);
@@ -189,15 +204,22 @@ async function openDrawer(id,name){
   if(!r.ok){
     const data = await r.json();
     showError(data.error || "Failed to fetch files.");
-    document.getElementById("fileList").innerHTML="<p class='text-center text-gray-400'>No files available.</p>";
+    fileList.innerHTML="<p class='text-center text-gray-400'>No files available.</p>";
     return;
   }
   const f = await r.json();
-  document.getElementById("fileList").innerHTML = f.map(x=>`
-  <label class="block p-3 border rounded-lg hover:bg-gray-50">
-   <input type="checkbox" checked name="file_ids" value="${x.id}">
-   ${x.name}
-  </label>`).join("");
+  fileList.replaceChildren();
+  f.forEach((item)=>{
+    const label = document.createElement("label");
+    label.className = "block rounded-lg border p-3 hover:bg-gray-50";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = true;
+    checkbox.name = "file_ids";
+    checkbox.value = item.id;
+    label.append(checkbox, document.createTextNode(` ${item.name}`));
+    fileList.appendChild(label);
+  });
   logToTerminal(`Found ${f.length} files available for download.`);
 }
 function closeDrawer(){
@@ -211,23 +233,49 @@ function toggleAllFiles(checked){
   });
 }
 
+const convertWord = document.getElementById("convertWord");
+const convertPowerPoint = document.getElementById("convertPowerPoint");
+const replaceOriginals = document.getElementById("replaceOriginals");
+
+function updateReplaceControl(){
+  replaceOriginals.disabled = !(convertWord.checked || convertPowerPoint.checked);
+  if(replaceOriginals.disabled){replaceOriginals.checked = false;}
+}
+convertWord.addEventListener("change", updateReplaceControl);
+convertPowerPoint.addEventListener("change", updateReplaceControl);
+
 function updateCourseCount(){
   const cards = Array.from(document.querySelectorAll(".course-card")).filter((c)=>!c.classList.contains("hidden"));
   courseCount.textContent = `${cards.length} course${cards.length === 1 ? "" : "s"}`;
 }
 
+let selectedCourseState = "all";
+
 function filterCourses(){
   const query = searchInput.value.toLowerCase().trim();
   document.querySelectorAll(".course-card").forEach((card)=>{
-    const name = card.dataset.courseName || "";
-    if(!query || name.includes(query)){
-      card.classList.remove("hidden");
-    } else {
-      card.classList.add("hidden");
-    }
+    const nameMatches = !query || (card.dataset.courseName || "").includes(query);
+    const stateMatches = selectedCourseState === "all" || card.dataset.courseState === selectedCourseState;
+    card.classList.toggle("hidden", !(nameMatches && stateMatches));
   });
   updateCourseCount();
 }
+
+document.querySelectorAll(".state-filter").forEach((button)=>{
+  button.addEventListener("click", ()=>{
+    selectedCourseState = button.dataset.stateFilter;
+    document.querySelectorAll(".state-filter").forEach((item)=>{
+      item.classList.toggle("bg-emerald-100", item === button);
+      item.classList.toggle("text-emerald-700", item === button);
+      item.classList.toggle("text-gray-500", item !== button);
+    });
+    filterCourses();
+  });
+});
+
+document.querySelectorAll("[data-manage-files]").forEach((button)=>{
+  button.addEventListener("click", ()=>openDrawer(button.dataset.courseId, button.dataset.courseName));
+});
 
 async function hydrateFileCounts(){
   const cards = document.querySelectorAll(".course-card");

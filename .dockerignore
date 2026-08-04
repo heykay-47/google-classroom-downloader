@@ -8,6 +8,7 @@ __pycache__/
 
 **/.env*
 **/credentials*.json
+**/gcr-downloader-credentials.json
 **/token*.json
 **/download_index.json
 **/downloads/

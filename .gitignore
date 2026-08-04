@@ -1,5 +1,6 @@
 # OAuth & Secrets 
 credentials*.json
+gcr-downloader-credentials.json
 token*.json
 .env
 
@@ -26,6 +27,7 @@ google-cloud-sdk/
 
 # Docker & deploy
 !cli/requirements.txt
+deploy/cloud-run-service.rendered.yaml
 
 
 # Logs
@@ -33,3 +35,6 @@ google-cloud-sdk/
 
 # Private runtime indexes 
 download_index.json
+
+# Git worktrees
+.worktrees/

@@ -9,10 +9,17 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
+from app.downloads import prepare_download
 from app.oauth import get_flow, SCOPES
-from app.classroom import list_all_courses, list_course_files
-from app.drive import download_file_bytes
 from app.zipstreamer import stream_zip
+from gcr_downloader.catalog import (
+    CatalogError,
+    get_course,
+    list_course_files,
+    list_courses,
+    select_course_files,
+)
+from gcr_downloader.models import DownloadOptions
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -95,12 +102,12 @@ def courses(request: Request):
 
     classroom = build("classroom", "v1", credentials=creds)
     try:
-        courses = list_all_courses(classroom)
+        courses = list_courses(classroom, state="all")
         error_message = None
-    except HTTPException as exc:
-        logger.warning("Failed to load courses: %s", exc.detail)
+    except CatalogError as exc:
+        logger.warning("Failed to load courses: %s", exc)
         courses = []
-        error_message = exc.detail
+        error_message = str(exc)
 
     return templates.TemplateResponse(
         "courses.html",
@@ -118,81 +125,53 @@ def logout(request: Request):
     return RedirectResponse("/login")
 
 
-# ======================= FIXED ENDPOINT =======================
-
-
 @app.post("/download")
 def download(
     request: Request,
-    course_ids: list[str] = Form(None),
+    course_id: str = Form(None),
     file_ids: list[str] = Form(None),
-    download_scope: str = Form("courses"),
+    skip_videos: bool = Form(False),
+    convert_word: bool = Form(False),
+    convert_powerpoint: bool = Form(False),
+    replace_originals: bool = Form(False),
 ):
     if "token" not in request.session:
         return RedirectResponse("/login")
+    if not course_id or not file_ids:
+        raise HTTPException(status_code=400, detail="Select at least one file")
 
-    if download_scope == "files":
-        if not file_ids:
-            raise HTTPException(status_code=400, detail="Select at least one file")
-    elif download_scope == "courses":
-        if not course_ids:
-            raise HTTPException(status_code=400, detail="Select at least one course")
-    else:
-        raise HTTPException(status_code=400, detail="Invalid download scope")
+    credentials = Credentials.from_authorized_user_info(request.session["token"], SCOPES)
+    classroom = build("classroom", "v1", credentials=credentials)
+    drive = build("drive", "v3", credentials=credentials)
+    try:
+        course = get_course(classroom, course_id)
+        available = list_course_files(classroom, course_id)
+        selected = select_course_files(available, file_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CatalogError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    creds = Credentials.from_authorized_user_info(request.session["token"], SCOPES)
-
-    classroom = build("classroom", "v1", credentials=creds)
-    drive = build("drive", "v3", credentials=creds)
-
-    def gen():
-        if download_scope == "files":
-            logger.info(f"=== DOWNLOADING {len(file_ids)} SELECTED FILES ===")
-            for fid in file_ids:
-                try:
-                    name, data = download_file_bytes(drive, fid)
-                    if name and data:
-                        yield f"files/{name}", data
-                except Exception:
-                    logger.exception("Failed to download file %s", fid)
-        else:
-            logger.info(f"=== STARTING DOWNLOAD FOR {len(course_ids)} COURSES ===")
-            for cid in course_ids:
-                logger.info(f"Processing Course: {cid}")
-                files = list_course_files(classroom, cid)
-                for fid, _ in files:
-                    try:
-                        name, data = download_file_bytes(drive, fid)
-                        if name and data:
-                            yield f"{cid}/{name}", data
-                    except Exception:
-                        logger.exception("Failed to download file %s", fid)
-        logger.info("=== ZIP GENERATION COMPLETE ===")
-
-    return stream_zip(gen())
-
-
-# =============================================================
+    options = DownloadOptions(
+        include_videos=not skip_videos,
+        convert_word=convert_word,
+        convert_powerpoint=convert_powerpoint,
+        keep_originals=not replace_originals,
+    )
+    entries, report = prepare_download(drive, course, selected, options)
+    return stream_zip(entries, report)
 
 
 @app.get("/api/courses/{course_id}/files")
 def get_course_files(request: Request, course_id: str):
     if "token" not in request.session:
         raise HTTPException(status_code=401)
-
     try:
-        creds = Credentials.from_authorized_user_info(request.session["token"], SCOPES)
-        classroom = build("classroom", "v1", credentials=creds)
+        credentials = Credentials.from_authorized_user_info(request.session["token"], SCOPES)
+        classroom = build("classroom", "v1", credentials=credentials)
         files = list_course_files(classroom, course_id)
-        return [{"id": f[0], "name": f[1]} for f in files]
-    except HTTPException as exc:
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"error": exc.detail},
-        )
-    except Exception:
-        logger.exception("Failed to load files for course %s", course_id)
-        return JSONResponse(
-            status_code=502,
-            content={"error": "Failed to fetch course files"},
-        )
+        return [{"id": item.id, "name": item.title_hint} for item in files]
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except CatalogError as exc:
+        return JSONResponse(status_code=502, content={"error": str(exc)})

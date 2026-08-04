@@ -1,0 +1,5 @@
+[lint.per-file-ignores]
+"cli/classroom_downloader.py" = ["E402"]
+"tests/test_cli.py" = ["E402"]
+"tests/test_parity_contract.py" = ["E402"]
+"tests/test_web_app.py" = ["E402"]

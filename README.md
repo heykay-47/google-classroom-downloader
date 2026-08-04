@@ -1,10 +1,6 @@
 # Google Classroom Auto File Downloader
 
-Fork of [Evani Menon's original project](https://github.com/evanimenon/google-classroom-downloader), published under the MIT License. This fork adds stronger filename and path handling, atomic downloads, safer Drive export and PDF conversion, resilient MIME handling, regression tests, and an improved web download flow.
-
-### NOTE: I am currently developing a web version of this for easier access for people who prefer not to run scripts locally. The web version is on hold while I wait for Google OAuth verification. Please stay tuned and thank you for the patience.
-
-
+Fork of [Evani Menon's original project](https://github.com/evanimenon/google-classroom-downloader), published under the MIT License. This fork adds stronger filename and path handling, atomic downloads, safer Drive export and PDF conversion, resilient MIME handling, regression tests, an improved web download flow, and full feature parity between the web app and the CLI.
 
 Automatically download all attachments (assignments, materials, links, PDFs, Docs, Slides, etc.) from your Google Classroom courses using the official Google Classroom + Drive APIs.
 
@@ -14,42 +10,39 @@ Automatically download all attachments (assignments, materials, links, PDFs, Doc
 
 ## Features
 
-- Downloads **all Drive attachments** from every Classroom course and organizes downloads into folders per course  
-- Converts Google Docs → PDF, Slides → PPTX, Sheets → XLSX  
-- Skips previously downloaded files automatically  
-- Filters by course name  
-- Fully secure OAuth authentication and 100% compliant with Google API policies  
+| Scope | Features |
+| --- | --- |
+| Shared | active/archived/all filters, Drive exports, video option, Word/PowerPoint conversion, keep/replace, retries, reports |
+| Web only | per-file selection, stateless ZIP, Gotenberg |
+| CLI only | course selection, base directory, dry-run, persistent index, local LibreOffice |
 
 ---
 
 ## Project Structure
 
 ```
-
 google-classroom-downloader/
 │
-├── cli/
-│ ├── classroom_downloader.py # Main script
-│ ├── requirements.txt # Dependencies
-│ └── README.md
-│
-├── docs/ # Legal / public website
-├── app/ # Cloud Run web app (FastAPI)
-└── README.md # Project root README
-
-````
+├── app/                     # Cloud Run web app (FastAPI)
+├── cli/                     # Local CLI downloader
+│   └── classroom_downloader.py
+├── gcr_downloader/          # Shared catalog, file policy, and models
+├── deploy/                  # Cloud Run multi-container config and renderer
+├── tests/                   # Unit, parity, and integration tests
+├── docs/                    # Legal / public website and design specs
+└── README.md                # Project root README
+```
 
 ---
 
-
-## Installation
+## Installation (CLI)
 
 ### 1. Clone this repository
 
 ```bash
 git clone https://github.com/heykay-47/google-classroom-downloader.git
 cd google-classroom-downloader/cli
-````
+```
 
 ### 2. Install dependencies
 
@@ -126,7 +119,7 @@ google-classroom-downloader/cli/credentials.json
 
 ---
 
-## Running the Downloader
+## Running the Downloader (CLI)
 
 Run:
 
@@ -150,52 +143,27 @@ downloads/
         file2.docx
 ```
 
----
+### Advanced Usage (CLI-only flags)
 
-## Web App Deployment (Cloud Run)
-
-### Required Environment Variables
-
-- `SESSION_SECRET`: Random secret for session cookies
-- `GOOGLE_OAUTH_JSON`: OAuth client JSON string (from Google Cloud Console)
-
-### Local Docker Run
+Download only archived courses:
 
 ```bash
-docker build -t classroom-downloader .
-docker run -p 8080:8080 \
-  -e SESSION_SECRET="your-secret" \
-  -e GOOGLE_OAUTH_JSON='{"web":{...}}' \
-  classroom-downloader
+python classroom_downloader.py --course-state archived
 ```
 
-### Deploy to Cloud Run
-
-```bash
-gcloud run deploy classroom-downloader \
-  --source . \
-  --region asia-south1 \
-  --set-env-vars SESSION_SECRET="your-secret" \
-  --set-env-vars GOOGLE_OAUTH_JSON='{"web":{...}}'
-```
-
-Make sure your OAuth redirect URI matches the deployed `/callback` URL.
-
-## Advanced Usage
-
-### Download only one course
+Download only one course:
 
 ```bash
 python classroom_downloader.py --course-name-contains "CSE201"
 ```
 
-### Run without downloading (simulation)
+Run without downloading (simulation):
 
 ```bash
 python classroom_downloader.py --dry-run
 ```
 
-### Change download directory
+Change download directory:
 
 ```bash
 python classroom_downloader.py --base-dir "/Users/me/ClassroomFiles"
@@ -203,6 +171,62 @@ python classroom_downloader.py --base-dir "/Users/me/ClassroomFiles"
 
 ---
 
+## Web App — Local Run (Compose)
+
+`compose.yaml` starts the web app plus a private [Gotenberg](https://gotenberg.dev) sidecar (pinned `gotenberg/gotenberg:8.34.0-libreoffice`, not exposed to the host) for Word and PowerPoint conversion.
+
+`GOOGLE_OAUTH_JSON` is **required** in the environment (the web app refuses to start without it). `SESSION_SECRET` is optional locally and defaults to `dev-secret`.
+
+```bash
+GOOGLE_OAUTH_JSON='{"web":{...}}' docker compose up --build
+```
+
+Open [http://localhost:8080](http://localhost:8080) and sign in. The compose file sets `REDIRECT_URI` to `http://localhost:8080/callback`; make sure that URI is registered as an authorized redirect URI on your OAuth client.
+
+To run the integration smoke test against the local Gotenberg container:
+
+```bash
+GOOGLE_OAUTH_JSON='{"web":{}}' docker compose up -d --wait gotenberg
+docker build -t classroom-downloader:test .
+docker run --rm --network gcr-downloader_default \
+  -v "$PWD/tests:/app/tests:ro" \
+  -e GOTENBERG_URL=http://gotenberg:3000 \
+  -e GOTENBERG_INTEGRATION=1 \
+  classroom-downloader:test \
+  python -m unittest discover -s tests -p 'test_gotenberg_integration.py' -v
+GOOGLE_OAUTH_JSON='{"web":{}}' docker compose down
+```
+
+## Web App Deployment (Cloud Run)
+
+The service runs two containers: the web app (port `8080`) and the Gotenberg sidecar (port `3000`, instance-local only).
+
+### Required Secret Manager secrets
+
+The rendered service reads both secrets with key `latest`:
+
+| Secret name | Contents |
+| --- | --- |
+| `classroom-session-secret` | Random secret used to sign session cookies |
+| `google-oauth-json` | Web OAuth client JSON string |
+
+### OAuth callback URI
+
+The app's default redirect URI is `https://classroom-downloader-web-936773451602.asia-south1.run.app/callback`. Register it as an authorized redirect URI on the OAuth client, or set the `REDIRECT_URI` environment variable to match your own domain's `/callback` URL.
+
+### Build the web image, render, and deploy
+
+```bash
+docker build -t "$WEB_IMAGE" .
+docker push "$WEB_IMAGE"
+
+python deploy/render_cloud_run.py --web-image "$WEB_IMAGE"
+gcloud run services replace deploy/cloud-run-service.rendered.yaml --region asia-south1
+```
+
+`deploy/render_cloud_run.py` substitutes your image reference into `deploy/cloud-run-service.yaml` and writes `deploy/cloud-run-service.rendered.yaml`. The rendered service sets `GOTENBERG_URL=http://localhost:3000` on the web container and configures concurrency `1`, a `900s` timeout, and a startup probe on Gotenberg.
+
+---
 
 ## !!! Security Warning for Contributors !!!
 
