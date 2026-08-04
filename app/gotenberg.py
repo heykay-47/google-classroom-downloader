@@ -43,6 +43,8 @@ def convert_to_pdf(
         for attempt in range(max_attempts):
             source.seek(0)
             response = None
+            output = None
+            keep_output = False
             try:
                 response = client.post(
                     f"{base_url.rstrip('/')}/forms/libreoffice/convert",
@@ -63,9 +65,9 @@ def convert_to_pdf(
                         output.write(chunk)
                 output.seek(0)
                 if output.read(5) != b"%PDF-":
-                    output.close()
                     raise GotenbergError("Conversion returned invalid PDF")
                 output.seek(0)
+                keep_output = True
                 return output
             except GotenbergError:
                 raise
@@ -76,6 +78,8 @@ def convert_to_pdf(
             finally:
                 if response is not None:
                     response.close()
+                if output is not None and not keep_output:
+                    output.close()
         raise GotenbergError("Conversion service unavailable")
     finally:
         if owns_client:

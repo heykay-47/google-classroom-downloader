@@ -235,6 +235,52 @@ class CliDownloaderTests(unittest.TestCase):
             self.assertEqual(report.items[0].status, "converted")
             self.assertEqual(report.items[0].output_paths, ("Course/slides.pdf",))
 
+    def test_metadata_request_retries_transient_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            request = mock.Mock()
+            request.execute.side_effect = [RuntimeError("transient"), {
+                "name": "report.pdf",
+                "mimeType": "application/pdf",
+            }]
+            files = mock.Mock()
+            files.get.return_value = request
+            drive = mock.Mock()
+            drive.files.return_value = files
+            report = DownloadReport()
+
+            with mock.patch.object(
+                downloader, "list_course_files", return_value=[CourseFile("file-id", "report.pdf")]
+            ), mock.patch.object(downloader.time, "sleep") as sleep:
+                downloader.download_all_for_course(
+                    object(), drive, Course("course-id", "Course", "ACTIVE"),
+                    pathlib.Path(directory), {}, DownloadOptions(), report, dry_run=True,
+                )
+
+            self.assertEqual(request.execute.call_count, 2)
+            sleep.assert_called_once_with(1)
+            self.assertEqual(report.items[0].status, "dry_run")
+
+    def test_metadata_request_stops_after_three_failures(self):
+        request = mock.Mock()
+        request.execute.side_effect = RuntimeError("transient")
+        files = mock.Mock()
+        files.get.return_value = request
+        drive = mock.Mock()
+        drive.files.return_value = files
+        report = DownloadReport()
+
+        with mock.patch.object(
+            downloader, "list_course_files", return_value=[CourseFile("file-id", "report.pdf")]
+        ), mock.patch.object(downloader.time, "sleep") as sleep:
+            downloader.download_all_for_course(
+                object(), drive, Course("course-id", "Course", "ACTIVE"),
+                pathlib.Path("downloads"), {}, DownloadOptions(), report,
+            )
+
+        self.assertEqual(request.execute.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+        self.assertEqual(report.items[0].status, "download_failed")
+
     def test_missing_duplicate_uses_recorded_relative_path(self):
         with tempfile.TemporaryDirectory() as directory:
             base_dir = pathlib.Path(directory)

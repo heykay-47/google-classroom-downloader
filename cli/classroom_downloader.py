@@ -18,6 +18,7 @@ from gcr_downloader.catalog import CatalogError, list_course_files, list_courses
 from gcr_downloader.files import (
     GOOGLE_EXPORTS,
     SCOPES,
+    allocate_unique_name,
     conversion_kind,
     ensure_extension,
     is_video_file,
@@ -188,20 +189,11 @@ def get_unique_path(dest_path: pathlib.Path) -> pathlib.Path:
     If dest_path already exists, append a numeric suffix to make it unique.
     e.g., report.pdf -> report_1.pdf -> report_2.pdf
     """
-    if not dest_path.exists():
-        return dest_path
-
-    stem = dest_path.stem
-    suffix = dest_path.suffix
-    parent = dest_path.parent
-    counter = 1
-
+    used_names = {path.name for path in dest_path.parent.iterdir()} if dest_path.parent.exists() else set()
     while True:
-        new_name = f"{stem}_{counter}{suffix}"
-        new_path = parent / new_name
-        if not new_path.exists():
-            return new_path
-        counter += 1
+        candidate = dest_path.with_name(allocate_unique_name(dest_path.name, used_names))
+        if not candidate.exists():
+            return candidate
 
 
 # ---------- CONVERSION HELPERS ----------
@@ -307,12 +299,18 @@ def download_all_for_course(
     base_path = base_dir.resolve()
     course_dir = base_path / safe_filename(course.name)
     for course_file in list_course_files(classroom_service, course.id):
-        try:
-            metadata = drive_service.files().get(
-                fileId=course_file.id,
-                fields="name,mimeType",
-            ).execute()
-        except Exception:
+        metadata = None
+        for attempt in range(3):
+            try:
+                metadata = drive_service.files().get(
+                    fileId=course_file.id,
+                    fields="name,mimeType",
+                ).execute()
+                break
+            except Exception:
+                if attempt < 2:
+                    time.sleep(2**attempt)
+        if metadata is None:
             report.add(ItemResult(course.name, course_file.title_hint, "download_failed", message="Failed to fetch file metadata"))
             continue
 

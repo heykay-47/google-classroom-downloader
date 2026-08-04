@@ -2,6 +2,8 @@ import io
 import unittest
 from unittest import mock
 
+import requests
+
 from app import drive, gotenberg
 
 
@@ -63,6 +65,36 @@ class WebAdapterTests(unittest.TestCase):
                 gotenberg.convert_to_pdf(io.BytesIO(b"doc"), "notes.docx", session=session)
         self.assertEqual(session.post.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    def test_gotenberg_stream_failure_closes_partial_spool(self):
+        spool = io.BytesIO()
+        response = mock.Mock(status_code=200, headers={"Content-Type": "application/pdf"})
+        response.iter_content.side_effect = requests.RequestException("stream failed")
+        session = mock.Mock()
+        session.post.return_value = response
+
+        with mock.patch.object(gotenberg.tempfile, "SpooledTemporaryFile", return_value=spool):
+            with self.assertRaises(gotenberg.GotenbergError):
+                gotenberg.convert_to_pdf(
+                    io.BytesIO(b"document"), "notes.docx", session=session, max_attempts=1
+                )
+
+        self.assertTrue(spool.closed)
+
+    def test_gotenberg_io_failure_closes_partial_spool(self):
+        spool = io.BytesIO()
+        response = mock.Mock(status_code=200, headers={"Content-Type": "application/pdf"})
+        response.iter_content.side_effect = OSError("read failed")
+        session = mock.Mock()
+        session.post.return_value = response
+
+        with mock.patch.object(gotenberg.tempfile, "SpooledTemporaryFile", return_value=spool):
+            with self.assertRaises(OSError):
+                gotenberg.convert_to_pdf(
+                    io.BytesIO(b"document"), "notes.docx", session=session, max_attempts=1
+                )
+
+        self.assertTrue(spool.closed)
 
 
 if __name__ == "__main__":
