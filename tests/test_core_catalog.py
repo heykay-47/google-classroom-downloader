@@ -43,10 +43,38 @@ class CatalogTests(unittest.TestCase):
                 {"driveFile": {"driveFile": {"id": "b", "title": "B"}}},
             ]}]
         })
+        courses.announcements.return_value.list.return_value = response({})
 
         files = list_course_files(classroom, "course-1")
 
         self.assertEqual([(item.id, item.title_hint) for item in files], [("a", "A"), ("b", "B")])
+
+    def test_course_files_include_paginated_announcement_attachments(self):
+        classroom = mock.Mock()
+        courses = classroom.courses.return_value
+        courses.courseWork.return_value.list.return_value = response({})
+        courses.courseWorkMaterials.return_value.list.return_value = response({})
+        courses.announcements.return_value.list.side_effect = [
+            response({
+                "announcements": [{"materials": [
+                    {"driveFile": {"driveFile": {"id": "a", "title": "Notice A"}}},
+                ]}],
+                "nextPageToken": "next",
+            }),
+            response({
+                "announcements": [{"materials": [
+                    {"driveFile": {"driveFile": {"id": "b", "title": "Notice B"}}},
+                ]}],
+            }),
+        ]
+
+        files = list_course_files(classroom, "course-1")
+
+        self.assertEqual([(item.id, item.title_hint) for item in files], [("a", "Notice A"), ("b", "Notice B")])
+        self.assertEqual(
+            courses.announcements.return_value.list.call_args_list[1].kwargs["pageToken"],
+            "next",
+        )
 
     def test_selection_rejects_file_not_in_course(self):
         available = list_course_files_from_pairs([("a", "A"), ("b", "B")])

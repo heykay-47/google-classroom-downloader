@@ -94,6 +94,17 @@ def list_course_files(classroom, course_id: str) -> list[CourseFile]:
             collect(payload, "courseWorkMaterial", "Material")
             page_token = payload.get("nextPageToken")
             if not page_token:
+                break
+
+        page_token = None
+        while True:
+            payload = classroom.courses().announcements().list(
+                courseId=course_id,
+                pageToken=page_token,
+            ).execute()
+            collect(payload, "announcements", "Announcement")
+            page_token = payload.get("nextPageToken")
+            if not page_token:
                 return files
     except Exception as exc:
         raise CatalogError("Failed to fetch course files") from exc

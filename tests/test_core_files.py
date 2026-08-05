@@ -2,6 +2,7 @@ import unittest
 
 from gcr_downloader.files import (
     GOOGLE_EXPORTS,
+    SCOPES,
     allocate_unique_name,
     conversion_kind,
     ensure_extension,
@@ -11,6 +12,14 @@ from gcr_downloader.files import (
     validate_file_id,
 )
 from gcr_downloader.models import DownloadOptions
+
+
+class OAuthScopeTests(unittest.TestCase):
+    def test_scopes_allow_reading_announcement_attachments(self):
+        self.assertIn(
+            "https://www.googleapis.com/auth/classroom.announcements.readonly",
+            SCOPES,
+        )
 
 
 class FilePolicyTests(unittest.TestCase):
