@@ -235,6 +235,101 @@ class CliDownloaderTests(unittest.TestCase):
             self.assertEqual(report.items[0].status, "converted")
             self.assertEqual(report.items[0].output_paths, ("Course/slides.pdf",))
 
+    def test_replace_conversion_removes_indexed_source_when_pdf_already_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = pathlib.Path(directory)
+            course_dir = base_dir / "Course"
+            course_dir.mkdir()
+            source = course_dir / "slides.pptx"
+            pdf = course_dir / "slides.pdf"
+            source.write_bytes(b"slides")
+            pdf.write_bytes(b"%PDF-converted")
+            downloaded_ids = {"file-id": "Course/slides.pptx"}
+            report = DownloadReport()
+
+            request = mock.Mock()
+            request.execute.return_value = {
+                "name": "slides.pptx",
+                "mimeType": "application/vnd.ms-powerpoint",
+            }
+            files = mock.Mock()
+            files.get.return_value = request
+            drive = mock.Mock()
+            drive.files.return_value = files
+
+            with mock.patch.object(
+                downloader,
+                "list_course_files",
+                return_value=[CourseFile("file-id", "slides.pptx")],
+            ), mock.patch.object(downloader, "download_drive_file") as download:
+                downloader.download_all_for_course(
+                    object(),
+                    drive,
+                    Course("course-id", "Course", "ACTIVE"),
+                    base_dir,
+                    downloaded_ids,
+                    DownloadOptions(convert_powerpoint=True, keep_originals=False),
+                    report,
+                    libreoffice_cmd="soffice",
+                )
+
+            download.assert_not_called()
+            self.assertFalse(source.exists())
+            self.assertEqual(downloaded_ids["file-id"], "Course/slides.pdf")
+            self.assertEqual(report.items[0].status, "converted")
+            self.assertEqual(report.items[0].output_paths, ("Course/slides.pdf",))
+
+    def test_replace_conversion_removes_redownloaded_source_when_pdf_already_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = pathlib.Path(directory)
+            course_dir = base_dir / "Course"
+            course_dir.mkdir()
+            source = course_dir / "slides.pptx"
+            pdf = course_dir / "slides.pdf"
+            pdf.write_bytes(b"%PDF-converted")
+            downloaded_ids = {"file-id": "Course/slides.pptx"}
+            report = DownloadReport()
+
+            request = mock.Mock()
+            request.execute.return_value = {
+                "name": "slides.pptx",
+                "mimeType": "application/vnd.ms-powerpoint",
+            }
+            files = mock.Mock()
+            files.get.return_value = request
+            drive = mock.Mock()
+            drive.files.return_value = files
+
+            def download(_drive, _file_id, destination, _mime_type):
+                destination.write_bytes(b"slides")
+                return True
+
+            with mock.patch.object(
+                downloader,
+                "list_course_files",
+                return_value=[CourseFile("file-id", "slides.pptx")],
+            ), mock.patch.object(
+                downloader,
+                "download_drive_file",
+                side_effect=download,
+            ) as download_file:
+                downloader.download_all_for_course(
+                    object(),
+                    drive,
+                    Course("course-id", "Course", "ACTIVE"),
+                    base_dir,
+                    downloaded_ids,
+                    DownloadOptions(convert_powerpoint=True, keep_originals=False),
+                    report,
+                    libreoffice_cmd="soffice",
+                )
+
+            download_file.assert_called_once()
+            self.assertFalse(source.exists())
+            self.assertEqual(downloaded_ids["file-id"], "Course/slides.pdf")
+            self.assertEqual(report.items[0].status, "converted")
+            self.assertEqual(report.items[0].output_paths, ("Course/slides.pdf",))
+
     def test_metadata_request_retries_transient_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             request = mock.Mock()
@@ -280,6 +375,63 @@ class CliDownloaderTests(unittest.TestCase):
         self.assertEqual(request.execute.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
         self.assertEqual(report.items[0].status, "download_failed")
+
+    def test_indexed_duplicate_collapses_to_identical_canonical_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = pathlib.Path(directory)
+            course_dir = base_dir / "Course"
+            course_dir.mkdir()
+            canonical = course_dir / "report.pdf"
+            duplicate = course_dir / "report_1.pdf"
+            canonical.write_bytes(b"same file")
+            duplicate.write_bytes(b"same file")
+            downloaded_ids = {"file-id": "Course/report_1.pdf"}
+            report = DownloadReport()
+
+            request = mock.Mock()
+            request.execute.return_value = {
+                "name": "report.pdf",
+                "mimeType": "application/pdf",
+            }
+            files = mock.Mock()
+            files.get.return_value = request
+            drive = mock.Mock()
+            drive.files.return_value = files
+
+            with mock.patch.object(
+                downloader,
+                "list_course_files",
+                return_value=[CourseFile("file-id", "report.pdf")],
+            ), mock.patch.object(downloader, "download_drive_file") as download:
+                downloader.download_all_for_course(
+                    object(),
+                    drive,
+                    Course("course-id", "Course", "ACTIVE"),
+                    base_dir,
+                    downloaded_ids,
+                    DownloadOptions(),
+                    report,
+                )
+
+            download.assert_not_called()
+            self.assertTrue(canonical.exists())
+            self.assertFalse(duplicate.exists())
+            self.assertEqual(downloaded_ids["file-id"], "Course/report.pdf")
+            self.assertEqual(report.items[0].status, "skipped_existing")
+            self.assertEqual(report.items[0].output_paths, ("Course/report.pdf",))
+
+    def test_different_content_collision_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            canonical = pathlib.Path(directory) / "report.pdf"
+            candidate = pathlib.Path(directory) / "report_1.pdf"
+            canonical.write_bytes(b"first file")
+            candidate.write_bytes(b"second file")
+
+            result = downloader.collapse_identical_duplicate(candidate, canonical)
+
+            self.assertEqual(result, candidate)
+            self.assertTrue(canonical.exists())
+            self.assertTrue(candidate.exists())
 
     def test_missing_duplicate_uses_recorded_relative_path(self):
         with tempfile.TemporaryDirectory() as directory:

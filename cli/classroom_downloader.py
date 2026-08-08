@@ -2,6 +2,7 @@ import os
 import io
 import json
 import pathlib
+import filecmp
 import argparse
 import sys
 import time
@@ -196,6 +197,18 @@ def get_unique_path(dest_path: pathlib.Path) -> pathlib.Path:
             return candidate
 
 
+def collapse_identical_duplicate(candidate: pathlib.Path, canonical: pathlib.Path) -> pathlib.Path:
+    if candidate == canonical or not candidate.is_file() or not canonical.is_file():
+        return candidate
+    try:
+        if filecmp.cmp(candidate, canonical, shallow=False):
+            candidate.unlink()
+            return canonical
+    except OSError:
+        pass
+    return candidate
+
+
 # ---------- CONVERSION HELPERS ----------
 
 
@@ -324,40 +337,60 @@ def download_all_for_course(
 
         indexed_path = get_indexed_path(base_path, downloaded_ids.get(course_file.id, ""))
         if indexed_path is not None and indexed_path.exists():
+            indexed_path = collapse_identical_duplicate(
+                indexed_path,
+                course_dir / source_name,
+            )
             relative = indexed_path.relative_to(base_path).as_posix()
             downloaded_ids[course_file.id] = relative
-            report.add(ItemResult(course.name, source_name, "skipped_existing", (relative,), "File already exists"))
-            continue
-        downloaded_ids.pop(course_file.id, None)
+            if (
+                dry_run
+                or conversion_kind(source_name, options) is None
+                or indexed_path.suffix.lower() == ".pdf"
+            ):
+                report.add(ItemResult(course.name, source_name, "skipped_existing", (relative,), "File already exists"))
+                continue
+            destination = indexed_path
+            relative_destination = relative
+        else:
+            downloaded_ids.pop(course_file.id, None)
+            destination = get_unique_path(course_dir / source_name)
+            relative_destination = destination.relative_to(base_path).as_posix()
+            if dry_run:
+                download_drive_file(
+                    drive_service,
+                    course_file.id,
+                    destination,
+                    metadata.get("mimeType"),
+                    dry_run=True,
+                )
+                report.add(ItemResult(course.name, source_name, "dry_run", (relative_destination,)))
+                continue
 
-        destination = get_unique_path(course_dir / source_name)
-        relative_destination = destination.relative_to(base_path).as_posix()
-        if dry_run:
-            download_drive_file(
+            if not download_drive_file(
                 drive_service,
                 course_file.id,
                 destination,
                 metadata.get("mimeType"),
-                dry_run=True,
+            ):
+                report.add(ItemResult(course.name, source_name, "download_failed", message="Download failed after three attempts"))
+                continue
+            destination = collapse_identical_duplicate(
+                destination,
+                course_dir / source_name,
             )
-            report.add(ItemResult(course.name, source_name, "dry_run", (relative_destination,)))
-            continue
-
-        if not download_drive_file(
-            drive_service,
-            course_file.id,
-            destination,
-            metadata.get("mimeType"),
-        ):
-            report.add(ItemResult(course.name, source_name, "download_failed", message="Download failed after three attempts"))
-            continue
+            relative_destination = destination.relative_to(base_path).as_posix()
 
         downloaded_ids[course_file.id] = relative_destination
         if conversion_kind(source_name, options) is None:
             report.add(ItemResult(course.name, source_name, "downloaded", (relative_destination,)))
             continue
 
-        pdf_path, error = convert_to_pdf(destination, libreoffice_cmd)
+        existing_pdf = destination.with_suffix(".pdf")
+        if existing_pdf.exists() and existing_pdf.stat().st_size > 0:
+            pdf_path, error = existing_pdf, ""
+        else:
+            pdf_path, error = convert_to_pdf(destination, libreoffice_cmd)
         if pdf_path is None:
             report.add(ItemResult(course.name, source_name, "conversion_failed", (relative_destination,), error))
             continue
