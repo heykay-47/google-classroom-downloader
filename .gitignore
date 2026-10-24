@@ -35,6 +35,7 @@ deploy/cloud-run-service.rendered.yaml
 
 # Private runtime indexes 
 download_index.json
+.download_index.json.*.tmp
 
 # Git worktrees
 .worktrees/

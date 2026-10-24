@@ -11,6 +11,7 @@ __pycache__/
 **/gcr-downloader-credentials.json
 **/token*.json
 **/download_index.json
+**/.download_index.json.*.tmp
 **/downloads/
 **/iiitd-resources/
 **/google-cloud-sdk/

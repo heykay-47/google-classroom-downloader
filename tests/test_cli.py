@@ -1,3 +1,4 @@
+import io
 import json
 import pathlib
 import sys
@@ -55,6 +56,166 @@ class SuccessfulDownloader:
 
 
 class CliDownloaderTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.index_path = pathlib.Path(directory.name) / "download_index.json"
+        patcher = mock.patch.object(downloader, "INDEX_FILE", str(self.index_path))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_cli(self, drive, files, directory, answers=None, extra_args=()):
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", ["gcr", "--base-dir", directory, *extra_args]), \
+             mock.patch.object(downloader, "get_credentials", return_value=object()), \
+             mock.patch.object(downloader, "build", side_effect=[object(), drive]), \
+             mock.patch.object(downloader, "list_courses", return_value=[Course("course-id", "Course", "ACTIVE")]), \
+             mock.patch.object(downloader, "list_course_files", return_value=files), \
+             mock.patch.object(downloader, "MediaIoBaseDownload", SuccessfulDownloader), \
+             mock.patch("builtins.input", side_effect=answers or ["all", "n", "n", "y"]), \
+             mock.patch("sys.stdout", output):
+            code = downloader.main()
+        return code, output.getvalue()
+
+    def test_interrupted_conversion_retains_completed_source_in_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            drive = mock.Mock()
+            drive.files.return_value.get.return_value.execute.return_value = {
+                "name": "slides.pptx", "mimeType": "application/vnd.ms-powerpoint",
+            }
+            with mock.patch.object(downloader, "check_libreoffice_available", return_value=(True, "soffice")), \
+                 mock.patch.object(downloader, "convert_to_pdf", side_effect=KeyboardInterrupt):
+                code, output = self.run_cli(
+                    drive, [CourseFile("file-id", "slides.pptx")], directory,
+                    answers=["all", "y", "n", "y", "y"],
+                )
+            self.assertEqual(code, 130)
+            self.assertIn("Download summary", output)
+            self.assertEqual(downloader.load_index(), {"file-id": "Course/slides.pptx"})
+            self.assertTrue((pathlib.Path(directory) / "Course/slides.pptx").is_file())
+
+    def test_checkpoint_failure_stops_before_downloading_the_next_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            drive = mock.Mock()
+            drive.files.return_value.get.return_value.execute.return_value = {
+                "name": "first.pdf", "mimeType": "application/pdf",
+            }
+            with mock.patch.object(pathlib.Path, "replace", side_effect=PermissionError("locked")):
+                # Use an already indexed file so the injected replace failure targets the index.
+                course_dir = pathlib.Path(directory) / "Course"
+                course_dir.mkdir()
+                (course_dir / "first.pdf").write_bytes(b"complete")
+                self.index_path.write_text(json.dumps({"downloaded_ids": {"first-id": "Course/first.pdf"}}))
+                previous = self.index_path.read_bytes()
+                code, output = self.run_cli(drive, [CourseFile("first-id", "first.pdf"), CourseFile("second-id", "second.pdf")], directory)
+            self.assertEqual(code, 1)
+            self.assertIn("locked", output)
+            self.assertIn("skipped_existing: 1", output)
+            self.assertEqual(drive.files.return_value.get.call_count, 1)
+        self.assertEqual(self.index_path.read_bytes(), previous)
+        self.assertEqual(list(self.index_path.parent.iterdir()), [self.index_path])
+
+    def test_failed_index_flush_preserves_previous_index(self):
+        downloader.save_index({"old-id": "Course/old.pdf"})
+        previous = self.index_path.read_bytes()
+        for error in (OSError("disk full"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(downloader.os, "fsync", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        downloader.save_index({"new-id": "Course/new.pdf"})
+                self.assertEqual(self.index_path.read_bytes(), previous)
+                self.assertEqual(list(self.index_path.parent.iterdir()), [self.index_path])
+
+    def test_conversion_failure_checkpoints_the_original_and_keeps_it_on_disk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            drive = mock.Mock()
+            drive.files.return_value.get.return_value.execute.return_value = {
+                "name": "slides.pptx", "mimeType": "application/vnd.ms-powerpoint",
+            }
+            with mock.patch.object(downloader, "check_libreoffice_available", return_value=(True, "soffice")), \
+                 mock.patch.object(downloader, "convert_to_pdf", return_value=(None, "conversion failed")):
+                code, output = self.run_cli(drive, [CourseFile("file-id", "slides.pptx")], directory, answers=["all", "y", "n", "y", "y"])
+            self.assertEqual(code, 0)
+            self.assertIn("conversion_failed: 1", output)
+            self.assertEqual(downloader.load_index(), {"file-id": "Course/slides.pptx"})
+            self.assertTrue((pathlib.Path(directory) / "Course/slides.pptx").is_file())
+
+    def test_failed_index_replace_preserves_previous_index_and_cleans_temp(self):
+        downloader.save_index({"old-id": "Course/old.pdf"})
+        previous = self.index_path.read_bytes()
+        with mock.patch.object(pathlib.Path, "replace", side_effect=PermissionError("locked")):
+            with self.assertRaises(OSError):
+                downloader.save_index({"new-id": "Course/new.pdf"})
+        self.assertEqual(self.index_path.read_bytes(), previous)
+        self.assertEqual(list(self.index_path.parent.iterdir()), [self.index_path])
+
+    def test_completed_file_is_checkpointed_before_the_next_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = pathlib.Path(directory)
+            drive = mock.Mock()
+            checkpoints = []
+
+            def metadata(*, fileId, **_kwargs):
+                if fileId == "second-id":
+                    checkpoints.append(downloader.load_index())
+                    raise KeyboardInterrupt
+                request = mock.Mock()
+                request.execute.return_value = {"name": "first.pdf", "mimeType": "application/pdf"}
+                return request
+
+            drive.files.return_value.get.side_effect = metadata
+            files = [CourseFile("first-id", "first.pdf"), CourseFile("second-id", "second.pdf")]
+            report = DownloadReport()
+            with mock.patch.object(downloader, "list_course_files", return_value=files), \
+                 mock.patch.object(downloader, "MediaIoBaseDownload", SuccessfulDownloader):
+                with self.assertRaises(KeyboardInterrupt):
+                    downloader.download_all_for_course(
+                        object(), drive, Course("course-id", "Course", "ACTIVE"),
+                        base_dir, {}, DownloadOptions(), report,
+                    )
+            self.assertEqual(len(report.items), 1)
+            self.assertEqual(checkpoints, [{"first-id": "Course/first.pdf"}])
+            self.assertEqual((base_dir / "Course/first.pdf").read_bytes(), b"complete")
+            self.assertEqual(downloader.load_index(), {"first-id": "Course/first.pdf"})
+
+    def test_ctrl_c_preserves_completed_files_and_prints_partial_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            drive = mock.Mock()
+            request = drive.files.return_value.get.return_value
+            request.execute.side_effect = [
+                {"name": "first.pdf", "mimeType": "application/pdf"}, KeyboardInterrupt,
+            ]
+            files = [CourseFile("first-id", "first.pdf"), CourseFile("second-id", "second.pdf")]
+            code, output = self.run_cli(drive, files, directory)
+            self.assertEqual(code, 130)
+            self.assertEqual(downloader.load_index(), {"first-id": "Course/first.pdf"})
+            self.assertIn("interrupted", output.lower())
+            self.assertIn("downloaded: 1", output)
+
+    def test_ctrl_c_before_the_first_download_does_not_mark_a_file_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            drive = mock.Mock()
+            drive.files.return_value.get.return_value.execute.side_effect = KeyboardInterrupt
+            code, output = self.run_cli(drive, [CourseFile("file-id", "notes.pdf")], directory)
+            self.assertEqual(code, 130)
+            self.assertEqual(downloader.load_index(), {})
+            self.assertNotIn("downloaded:", output)
+
+    def test_ctrl_c_dry_run_does_not_write_the_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            drive = mock.Mock()
+            drive.files.return_value.get.return_value.execute.side_effect = [
+                {"name": "first.pdf", "mimeType": "application/pdf"}, KeyboardInterrupt,
+            ]
+            code, output = self.run_cli(
+                drive, [CourseFile("first-id", "first.pdf"), CourseFile("second-id", "second.pdf")],
+                directory, extra_args=["--dry-run"],
+            )
+            self.assertEqual(code, 130)
+            self.assertIn("dry_run: 1", output)
+            self.assertFalse(self.index_path.exists())
+            self.assertEqual(list(pathlib.Path(directory).iterdir()), [])
+
     def test_safe_filename_rejects_dot_path_components(self):
         self.assertEqual(downloader.safe_filename("."), "file")
         self.assertEqual(downloader.safe_filename(".."), "file")
@@ -117,6 +278,19 @@ class CliDownloaderTests(unittest.TestCase):
 
             self.assertFalse(result)
             self.assertFalse(destination.exists())
+            self.assertEqual(list(destination.parent.iterdir()), [])
+
+    def test_interrupted_download_removes_partial_file(self):
+        class InterruptedDownloader(FailingDownloader):
+            def next_chunk(self):
+                self.file_handle.write(b"partial")
+                raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = pathlib.Path(directory) / "report.pdf"
+            with mock.patch.object(downloader, "MediaIoBaseDownload", InterruptedDownloader):
+                with self.assertRaises(KeyboardInterrupt):
+                    downloader.download_drive_file(FakeDrive(), "file-id", destination, "application/pdf")
             self.assertEqual(list(destination.parent.iterdir()), [])
 
     def test_successful_download_atomically_replaces_destination(self):
@@ -234,6 +408,7 @@ class CliDownloaderTests(unittest.TestCase):
             self.assertEqual(downloaded_ids["file-id"], "Course/slides.pdf")
             self.assertEqual(report.items[0].status, "converted")
             self.assertEqual(report.items[0].output_paths, ("Course/slides.pdf",))
+            self.assertEqual(downloader.load_index(), {"file-id": "Course/slides.pdf"})
 
     def test_replace_conversion_removes_indexed_source_when_pdf_already_exists(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -278,6 +453,7 @@ class CliDownloaderTests(unittest.TestCase):
             self.assertEqual(downloaded_ids["file-id"], "Course/slides.pdf")
             self.assertEqual(report.items[0].status, "converted")
             self.assertEqual(report.items[0].output_paths, ("Course/slides.pdf",))
+            self.assertEqual(downloader.load_index(), {"file-id": "Course/slides.pdf"})
 
     def test_replace_conversion_removes_redownloaded_source_when_pdf_already_exists(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -329,6 +505,7 @@ class CliDownloaderTests(unittest.TestCase):
             self.assertEqual(downloaded_ids["file-id"], "Course/slides.pdf")
             self.assertEqual(report.items[0].status, "converted")
             self.assertEqual(report.items[0].output_paths, ("Course/slides.pdf",))
+            self.assertEqual(downloader.load_index(), {"file-id": "Course/slides.pdf"})
 
     def test_metadata_request_retries_transient_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -419,6 +596,37 @@ class CliDownloaderTests(unittest.TestCase):
             self.assertEqual(downloaded_ids["file-id"], "Course/report.pdf")
             self.assertEqual(report.items[0].status, "skipped_existing")
             self.assertEqual(report.items[0].output_paths, ("Course/report.pdf",))
+            self.assertEqual(downloader.load_index(), {"file-id": "Course/report.pdf"})
+
+    def test_dry_run_preserves_duplicates_index_and_directory_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_dir = pathlib.Path(directory)
+            course_dir = base_dir / "Course"
+            course_dir.mkdir()
+            (course_dir / "report.pdf").write_bytes(b"same")
+            (course_dir / "report_1.pdf").write_bytes(b"same")
+            ids = {"file-id": "Course/report_1.pdf", "missing-id": "Course/missing.pdf"}
+            downloader.save_index(ids)
+            previous_index = self.index_path.read_bytes()
+            previous_tree = {p.relative_to(base_dir): p.read_bytes() for p in base_dir.rglob("*") if p.is_file()}
+            drive = mock.Mock()
+            drive.files.return_value.get.return_value.execute.side_effect = [
+                {"name": "report.pdf", "mimeType": "application/pdf"},
+                {"name": "missing.pdf", "mimeType": "application/pdf"},
+            ]
+            with mock.patch.object(downloader, "list_course_files", return_value=[
+                CourseFile("file-id", "report.pdf"), CourseFile("missing-id", "missing.pdf"),
+            ]):
+                downloader.download_all_for_course(
+                    object(), drive, Course("course-id", "Course", "ACTIVE"),
+                    base_dir, ids, DownloadOptions(), DownloadReport(), dry_run=True,
+                )
+            self.assertEqual(ids, {"file-id": "Course/report_1.pdf", "missing-id": "Course/missing.pdf"})
+            self.assertEqual(self.index_path.read_bytes(), previous_index)
+            self.assertEqual({p.relative_to(base_dir): p.read_bytes() for p in base_dir.rglob("*") if p.is_file()}, previous_tree)
+            destination = base_dir / "uncreated" / "file.pdf"
+            downloader.download_drive_file(FakeDrive(), "new-id", destination, "application/pdf", dry_run=True)
+            self.assertFalse(destination.parent.exists())
 
     def test_different_content_collision_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -523,6 +731,23 @@ class CliDownloaderTests(unittest.TestCase):
                 result = downloader.load_index()
 
             self.assertEqual(result, {"first-id": "", "second-id": ""})
+
+    def test_corrupt_index_stops_run_without_overwriting_evidence(self):
+        for contents in (b"{", b"[]", b"{}", b'{"downloaded_ids":"bad"}', b'{"downloaded_ids":{"id":null}}', b"\xff"):
+            with self.subTest(contents=contents):
+                self.index_path.write_bytes(contents)
+                output = io.StringIO()
+                with mock.patch.object(sys, "argv", ["gcr"]), \
+                     mock.patch.object(downloader, "get_credentials") as auth, \
+                     mock.patch("sys.stdout", output):
+                    self.assertEqual(downloader.main(), 1)
+                auth.assert_not_called()
+                self.assertEqual(self.index_path.read_bytes(), contents)
+                self.assertIn("index", output.getvalue().lower())
+                self.assertIn("back up", output.getvalue().lower())
+
+    def test_missing_index_starts_empty(self):
+        self.assertEqual(downloader.load_index(), {})
 
     def test_indexed_path_must_stay_inside_download_directory(self):
         with tempfile.TemporaryDirectory() as directory:

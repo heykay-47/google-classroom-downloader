@@ -145,6 +145,22 @@ downloads/
 
 ### Advanced Usage (CLI-only flags)
 
+The CLI saves `download_index.json` in the current working directory after each
+file's outcome using a flushed temporary file and atomic replacement. Restart
+from the same working directory and download directory to reuse that checkpoint.
+The index format is unchanged, including support for legacy file-ID lists.
+
+Press **Ctrl+C** to stop: completed work is checkpointed, a partial summary is
+printed, and the CLI exits with code `130`. An interrupted download's partial
+file is removed. If conversion is interrupted, the downloaded source is kept for
+the next run. A checkpoint write failure stops the run with an error rather than
+continuing without durable progress.
+
+If the index is corrupt, the CLI stops before authentication and leaves it
+untouched. Back it up outside the repository, then repair it or move it aside to
+start with an empty index (which may redownload files). **Dry-run** does not write
+the index, create download directories, convert files, or delete duplicates.
+
 Download only archived courses:
 
 ```bash
@@ -225,6 +241,46 @@ gcloud run services replace deploy/cloud-run-service.rendered.yaml --region asia
 ```
 
 `deploy/render_cloud_run.py` substitutes your image reference into `deploy/cloud-run-service.yaml` and writes `deploy/cloud-run-service.rendered.yaml`. The rendered service sets `GOTENBERG_URL=http://localhost:3000` on the web container and configures concurrency `1`, a `900s` timeout, and a startup probe on Gotenberg.
+
+---
+
+## Development checks
+
+GitHub Actions runs unit tests and Ruff on Python 3.12 for every push and pull
+request. From the repository root, use the same Python version and development
+dependencies locally.
+
+### WSL / Linux / macOS (bash)
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+python -m ruff check .
+```
+
+For a checkout under `/mnt/c` in WSL, put the Linux virtual environment on the
+Linux filesystem instead (for example, `~/.venvs/gcr-downloader`) and activate
+that path. Keep Linux and native Windows virtual environments separate.
+
+### Native Windows (PowerShell, without activation)
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m ruff check .
+```
+
+The unit tests use stubs/mocks and need no Google credentials, Docker, or live
+services. Leave `GOTENBERG_INTEGRATION` unset (or set it to `0`) for these checks;
+the Gotenberg smoke test is skipped by default. To explicitly run it against a
+real sidecar, follow the opt-in Compose instructions above.
+
+Ruff is pinned in `requirements-dev.txt`; `.ruff.toml` keeps the existing rule
+baseline and per-file exceptions explicit. CI installs dependencies from the
+package index but does not authenticate to Google or deploy anything.
 
 ---
 

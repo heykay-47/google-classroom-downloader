@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from unittest import mock
 
@@ -46,7 +47,9 @@ class ParityContractTests(unittest.TestCase):
             )
 
         cli_report = DownloadReport()
-        with mock.patch.object(cli, "list_course_files", return_value=[course_file]), \
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(cli, "INDEX_FILE", str(cli.pathlib.Path(directory) / "download_index.json")), \
+             mock.patch.object(cli, "list_course_files", return_value=[course_file]), \
              mock.patch.object(cli, "download_drive_file") as cli_download:
             cli.download_all_for_course(
                 object(),

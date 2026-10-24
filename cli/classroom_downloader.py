@@ -78,30 +78,50 @@ def load_index() -> Dict[str, str]:
     """
     Load previously downloaded file IDs from INDEX_FILE.
     """
-    if not os.path.exists(INDEX_FILE):
-        return {}
     try:
         with open(INDEX_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        downloaded_ids = data.get("downloaded_ids", {})
-        if isinstance(downloaded_ids, dict):
-            return {str(file_id): str(path) for file_id, path in downloaded_ids.items()}
-        return {str(file_id): "" for file_id in downloaded_ids}
-    except Exception:
-        # If corrupted, ignore
+        if not isinstance(data, dict) or "downloaded_ids" not in data:
+            raise ValueError("Expected a downloaded_ids mapping or legacy list")
+        downloaded_ids = data["downloaded_ids"]
+        if isinstance(downloaded_ids, dict) and all(isinstance(path, str) for path in downloaded_ids.values()):
+            return dict(downloaded_ids)
+        if isinstance(downloaded_ids, list) and all(isinstance(file_id, (str, int)) for file_id in downloaded_ids):
+            return {str(file_id): "" for file_id in downloaded_ids}
+        raise ValueError("Invalid downloaded_ids entries")
+    except FileNotFoundError:
         return {}
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid download index '{INDEX_FILE}': {exc}. Original left unchanged. "
+            "Back up and repair it, or move it aside before restarting with an empty index."
+        ) from exc
 
 
 def save_index(downloaded_ids: Dict[str, str]) -> None:
     """
     Save downloaded file IDs to INDEX_FILE.
     """
-    with open(INDEX_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            {"downloaded_ids": dict(sorted(downloaded_ids.items()))},
-            f,
-            indent=2,
-        )
+    index_path = pathlib.Path(INDEX_FILE).resolve()
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=index_path.parent,
+            prefix=f".{index_path.name}.", suffix=".tmp", delete=False,
+        ) as f:
+            temp_path = pathlib.Path(f.name)
+            json.dump(
+                {"downloaded_ids": dict(sorted(downloaded_ids.items()))},
+                f,
+                indent=2,
+            )
+            f.flush()
+            os.fsync(f.fileno())
+        # Close the temporary file before replacement for Windows compatibility.
+        temp_path.replace(index_path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def get_indexed_path(base_dir: pathlib.Path, stored_path: str) -> pathlib.Path | None:
@@ -136,11 +156,11 @@ def download_drive_file(
     Handles Google Docs / Sheets / Slides export via files.export.
     Returns True if successful, False otherwise.
     """
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-
     if dry_run:
         print(f"[DRY RUN] Would download: {file_id} -> {dest_path}")
         return True
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
 
     for attempt in range(max_retries):
         temp_path = None
@@ -172,8 +192,6 @@ def download_drive_file(
             print(f"Downloaded: {dest_path}")
             return True
         except Exception as e:
-            if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
             if attempt < max_retries - 1:
                 wait_time = 2**attempt
                 print(
@@ -183,6 +201,9 @@ def download_drive_file(
             else:
                 print(f"Failed to download {file_id} after {max_retries} attempts: {e}")
                 return False
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
 
 def get_unique_path(dest_path: pathlib.Path) -> pathlib.Path:
@@ -311,6 +332,12 @@ def download_all_for_course(
 ) -> None:
     base_path = base_dir.resolve()
     course_dir = base_path / safe_filename(course.name)
+
+    def record(result: ItemResult) -> None:
+        report.add(result)
+        if not dry_run:
+            save_index(downloaded_ids)
+
     for course_file in list_course_files(classroom_service, course.id):
         metadata = None
         for attempt in range(3):
@@ -324,7 +351,7 @@ def download_all_for_course(
                 if attempt < 2:
                     time.sleep(2**attempt)
         if metadata is None:
-            report.add(ItemResult(course.name, course_file.title_hint, "download_failed", message="Failed to fetch file metadata"))
+            record(ItemResult(course.name, course_file.title_hint, "download_failed", message="Failed to fetch file metadata"))
             continue
 
         source_name = ensure_extension(
@@ -332,28 +359,31 @@ def download_all_for_course(
             metadata.get("mimeType"),
         )
         if not options.include_videos and is_video_file(source_name, metadata.get("mimeType")):
-            report.add(ItemResult(course.name, source_name, "skipped_video", message="Video excluded"))
+            record(ItemResult(course.name, source_name, "skipped_video", message="Video excluded"))
             continue
 
         indexed_path = get_indexed_path(base_path, downloaded_ids.get(course_file.id, ""))
         if indexed_path is not None and indexed_path.exists():
-            indexed_path = collapse_identical_duplicate(
-                indexed_path,
-                course_dir / source_name,
-            )
+            if not dry_run:
+                indexed_path = collapse_identical_duplicate(
+                    indexed_path,
+                    course_dir / source_name,
+                )
             relative = indexed_path.relative_to(base_path).as_posix()
-            downloaded_ids[course_file.id] = relative
+            if not dry_run:
+                downloaded_ids[course_file.id] = relative
             if (
                 dry_run
                 or conversion_kind(source_name, options) is None
                 or indexed_path.suffix.lower() == ".pdf"
             ):
-                report.add(ItemResult(course.name, source_name, "skipped_existing", (relative,), "File already exists"))
+                record(ItemResult(course.name, source_name, "skipped_existing", (relative,), "File already exists"))
                 continue
             destination = indexed_path
             relative_destination = relative
         else:
-            downloaded_ids.pop(course_file.id, None)
+            if not dry_run:
+                downloaded_ids.pop(course_file.id, None)
             destination = get_unique_path(course_dir / source_name)
             relative_destination = destination.relative_to(base_path).as_posix()
             if dry_run:
@@ -364,7 +394,7 @@ def download_all_for_course(
                     metadata.get("mimeType"),
                     dry_run=True,
                 )
-                report.add(ItemResult(course.name, source_name, "dry_run", (relative_destination,)))
+                record(ItemResult(course.name, source_name, "dry_run", (relative_destination,)))
                 continue
 
             if not download_drive_file(
@@ -373,7 +403,7 @@ def download_all_for_course(
                 destination,
                 metadata.get("mimeType"),
             ):
-                report.add(ItemResult(course.name, source_name, "download_failed", message="Download failed after three attempts"))
+                record(ItemResult(course.name, source_name, "download_failed", message="Download failed after three attempts"))
                 continue
             destination = collapse_identical_duplicate(
                 destination,
@@ -383,7 +413,7 @@ def download_all_for_course(
 
         downloaded_ids[course_file.id] = relative_destination
         if conversion_kind(source_name, options) is None:
-            report.add(ItemResult(course.name, source_name, "downloaded", (relative_destination,)))
+            record(ItemResult(course.name, source_name, "downloaded", (relative_destination,)))
             continue
 
         existing_pdf = destination.with_suffix(".pdf")
@@ -392,7 +422,7 @@ def download_all_for_course(
         else:
             pdf_path, error = convert_to_pdf(destination, libreoffice_cmd)
         if pdf_path is None:
-            report.add(ItemResult(course.name, source_name, "conversion_failed", (relative_destination,), error))
+            record(ItemResult(course.name, source_name, "conversion_failed", (relative_destination,), error))
             continue
 
         relative_pdf = pdf_path.relative_to(base_path).as_posix()
@@ -401,11 +431,11 @@ def download_all_for_course(
             try:
                 destination.unlink()
             except OSError:
-                report.add(ItemResult(course.name, source_name, "conversion_failed", outputs, "Converted PDF created but original could not be removed"))
+                record(ItemResult(course.name, source_name, "conversion_failed", outputs, "Converted PDF created but original could not be removed"))
                 continue
             downloaded_ids[course_file.id] = relative_pdf
             outputs = (relative_pdf,)
-        report.add(ItemResult(course.name, source_name, "converted", outputs))
+        record(ItemResult(course.name, source_name, "converted", outputs))
 
 
 # ---------- MAIN / CLI ----------
@@ -522,6 +552,28 @@ def select_courses(courses: List[Course]) -> List[Course]:
 
 def main() -> int:
     args = parse_args()
+    downloaded_ids = None
+    report = DownloadReport()
+    try:
+        print("Loading download index...")
+        downloaded_ids = load_index()
+        return run_downloads(args, downloaded_ids, report)
+    except KeyboardInterrupt:
+        print("\nDownload interrupted. Showing partial results.")
+        if downloaded_ids is not None and not args.dry_run:
+            try:
+                save_index(downloaded_ids)
+            except OSError as exc:
+                print(f"Could not checkpoint index: {exc}. Previous checkpoint retained.")
+        render_report(report)
+        return 130
+    except (CatalogError, OSError, ValueError) as exc:
+        print(f"Download stopped: {exc}")
+        render_report(report)
+        return 1
+
+
+def run_downloads(args, downloaded_ids: Dict[str, str], report: DownloadReport) -> int:
     base_dir = pathlib.Path(args.base_dir)
 
     print("Authenticating with Google...")
@@ -529,19 +581,12 @@ def main() -> int:
     classroom_service = build("classroom", "v1", credentials=creds)
     drive_service = build("drive", "v3", credentials=creds)
 
-    print("Loading download index...")
-    downloaded_ids = load_index()
-
     print("Fetching courses...")
-    try:
-        courses = list_courses(
-            classroom_service,
-            state=args.course_state,
-            name_contains=args.course_name_contains,
-        )
-    except CatalogError as exc:
-        print(str(exc))
-        return 1
+    courses = list_courses(
+        classroom_service,
+        state=args.course_state,
+        name_contains=args.course_name_contains,
+    )
 
     if not courses:
         print("No courses found that match your filter.")
@@ -572,27 +617,18 @@ def main() -> int:
         convert_powerpoint=conversion_prefs["convert_ppt"],
         keep_originals=not conversion_prefs["delete_originals"],
     )
-    report = DownloadReport()
-
-    try:
-        for course in selected_courses:
-            download_all_for_course(
-                classroom_service,
-                drive_service,
-                course,
-                base_dir,
-                downloaded_ids,
-                options,
-                report,
-                libreoffice_cmd=libreoffice_cmd,
-                dry_run=args.dry_run,
-            )
-    except CatalogError as exc:
-        print(str(exc))
-        return 1
-
-    if not args.dry_run:
-        save_index(downloaded_ids)
+    for course in selected_courses:
+        download_all_for_course(
+            classroom_service,
+            drive_service,
+            course,
+            base_dir,
+            downloaded_ids,
+            options,
+            report,
+            libreoffice_cmd=libreoffice_cmd,
+            dry_run=args.dry_run,
+        )
     render_report(report)
     return 0
 
