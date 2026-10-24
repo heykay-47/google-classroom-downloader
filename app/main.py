@@ -1,10 +1,13 @@
 import os
 import json
 import logging
+import re
+from html import escape
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import HTMLResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -135,6 +138,39 @@ def download(
     convert_powerpoint: bool = Form(False),
     replace_originals: bool = Form(False),
 ):
+    # Optional browser handshake. Legacy/direct callers retain their response contract.
+    token = getattr(request, "query_params", {}).get("download_token")
+    if token is not None and not re.fullmatch(r"[a-f0-9]{32}", token):
+        raise HTTPException(status_code=400, detail="Invalid download token")
+    try:
+        if token and "token" not in request.session:
+            raise HTTPException(status_code=401, detail="Your session expired. Sign in again, then retry the download.")
+        response = _download_response(request, course_id, file_ids, skip_videos,
+                                      convert_word, convert_powerpoint, replace_originals)
+    except Exception as exc:
+        if not token:
+            raise
+        if isinstance(exc, HTTPException):
+            status, message = exc.status_code, str(exc.detail)
+            if status >= 500:
+                message += ". Retry, or sign in again if your session has expired."
+        else:
+            logger.exception("Download preparation failed")
+            status = 500
+            message = "Could not prepare the download. Retry, or sign in again if your session has expired."
+        return HTMLResponse(
+            f'<p data-download-token="{token}" data-download-error>{escape(message)}</p>',
+            status_code=status, headers={"Cache-Control": "no-store"},
+        )
+    if token:
+        response.set_cookie(f"download_status_{token}", "ready", max_age=300,
+                            secure=not IS_LOCAL, httponly=False, samesite="lax", path="/")
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _download_response(request, course_id, file_ids, skip_videos,
+                       convert_word, convert_powerpoint, replace_originals):
     if "token" not in request.session:
         return RedirectResponse("/login")
     if not course_id or not file_ids:
