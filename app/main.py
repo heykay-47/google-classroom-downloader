@@ -206,7 +206,16 @@ def get_course_files(request: Request, course_id: str):
         credentials = Credentials.from_authorized_user_info(request.session["token"], SCOPES)
         classroom = build("classroom", "v1", credentials=credentials)
         files = list_course_files(classroom, course_id)
-        return [{"id": item.id, "name": item.title_hint} for item in files]
+        return [{
+            "id": item.id,
+            "name": item.title_hint,
+            "source_kind": item.source_kind,
+            "post_id": item.post_id,
+            "post_title": item.post_title,
+            "post_date": item.post_date,
+            "file_type": item.file_type,
+            "file_type_source": "extension" if item.file_type else None,
+        } for item in files]
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
     except CatalogError as exc:
