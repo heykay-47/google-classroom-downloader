@@ -15,6 +15,48 @@ def response(payload):
 
 
 class CatalogTests(unittest.TestCase):
+    def test_file_metadata_comes_from_first_post_and_attachment_hint(self):
+        classroom = mock.Mock()
+        courses = classroom.courses.return_value
+        def attachment(file_id, title):
+            return {"driveFile": {"driveFile": {"id": file_id, "title": title}}}
+
+        courses.courseWork.return_value.list.return_value = response({"courseWork": [{
+            "id": "p1", "title": "Week 1", "creationTime": "2026-10-01T12:00:00Z",
+            "materials": [attachment("a", "Notes.PDF")],
+        }]})
+        courses.courseWorkMaterials.return_value.list.return_value = response({"courseWorkMaterial": [{
+            "id": "p2", "title": "", "materials": [attachment("a", "duplicate.docx"), attachment("b", "slides.pptx")],
+        }]})
+        courses.announcements.return_value.list.return_value = response({"announcements": [{
+            "id": "p3", "materials": [attachment("c", "No extension")],
+        }]})
+
+        files = list_course_files(classroom, "course-1")
+
+        self.assertEqual([(f.source_kind, f.post_id, f.post_title, f.post_date, f.file_type) for f in files], [
+            ("assignment", "p1", "Week 1", "2026-10-01T12:00:00Z", "pdf"),
+            ("material", "p2", "Material", None, "pptx"),
+            ("announcement", "p3", "Announcement", None, None),
+        ])
+        self.assertEqual([f.id for f in files], ["a", "b", "c"])
+
+    def test_missing_filename_does_not_infer_type_from_post_title(self):
+        classroom = mock.Mock()
+        courses = classroom.courses.return_value
+        courses.courseWork.return_value.list.return_value = response({"courseWork": [{
+            "title": "Post named notes.pdf", "materials": [{"driveFile": {"driveFile": {"id": "a"}}}],
+        }]})
+        courses.courseWorkMaterials.return_value.list.return_value = response({})
+        courses.announcements.return_value.list.return_value = response({})
+
+        item, = list_course_files(classroom, "course-1")
+
+        self.assertEqual(item.title_hint, "Post named notes.pdf")
+        self.assertIsNone(item.file_type)
+        self.assertIsNone(item.post_id)
+        self.assertIsNone(item.post_date)
+
     def test_courses_paginate_and_filter_archived(self):
         classroom = mock.Mock()
         resource = classroom.courses.return_value

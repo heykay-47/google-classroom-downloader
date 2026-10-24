@@ -20,6 +20,9 @@ body {
   height: 28px;
   animation: spin 0.9s linear infinite;
 }
+[hidden] { display: none !important; }
+#drawer :focus-visible { outline: 2px solid #047857; outline-offset: 3px; }
+#drawer { max-height: 100dvh; }
 @keyframes spin {
   0% { transform: rotate(0deg); }
   100% { transform: rotate(360deg); }
@@ -127,25 +130,30 @@ body {
 
 <!-- Drawer -->
 <div id="drawerOverlay" onclick="closeDrawer()" class="fixed inset-0 bg-black/40 hidden z-40"></div>
-<div id="drawer" class="fixed right-0 top-0 h-full w-full max-w-md bg-white shadow-2xl z-50 transform translate-x-full transition flex flex-col">
+<div id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle" aria-hidden="true" inert class="fixed right-0 top-0 h-full w-full max-w-md bg-white shadow-2xl z-50 transform translate-x-full transition flex flex-col">
 
 <div class="p-6 border-b flex justify-between items-center shrink-0">
-  <div>
-    <h2 id="drawerTitle" class="font-bold text-xl"></h2>
+  <div class="min-w-0">
+    <h2 id="drawerTitle" class="font-bold text-xl break-words"></h2>
     <p class="text-sm text-gray-500">Select files to include</p>
   </div>
-  <button onclick="closeDrawer()" class="text-3xl text-gray-400">&times;</button>
+  <button id="closeDrawerButton" type="button" aria-label="Close file picker" onclick="closeDrawer()" class="text-3xl text-gray-500 p-2">&times;</button>
 </div>
 
-<form action="/download" method="post" class="flex flex-col flex-1 min-h-0">
+<form action="/download" method="post" class="flex flex-col flex-1 min-h-0 overflow-y-auto">
 <input type="hidden" name="course_id" id="activeCourseId">
 
-<div class="px-6 pt-5 flex items-center justify-between text-xs text-gray-500">
-  <span>Quick actions</span>
-  <div class="flex gap-2">
-    <button type="button" onclick="toggleAllFiles(true)" class="rounded-lg border border-gray-200 px-3 py-1">Select all</button>
-    <button type="button" onclick="toggleAllFiles(false)" class="rounded-lg border border-gray-200 px-3 py-1">Clear</button>
+<div class="px-6 py-5 shrink-0 space-y-3 text-sm text-gray-600">
+  <div class="flex flex-wrap gap-2">
+    <button id="selectCourseFiles" type="button" onclick="toggleAllFiles(true)" class="rounded-lg border border-gray-200 px-3 py-2">Select entire course</button>
+    <button id="clearCourseFiles" type="button" onclick="toggleAllFiles(false)" class="rounded-lg border border-gray-200 px-3 py-2">Clear entire course</button>
   </div>
+  <label for="fileTypeFilter" class="block font-semibold">File type</label>
+  <select id="fileTypeFilter" class="w-full rounded-lg border border-gray-200 bg-white p-2">
+    <option value="all">All types</option>
+  </select>
+  <p class="text-xs">Types are inferred from filename extensions, not verified MIME types.</p>
+  <p id="selectionCount" role="status" aria-live="polite" class="font-semibold">0 selected · 0 hidden by filter</p>
 </div>
 
 <fieldset class="shrink-0 space-y-3 border-t p-6 text-sm">
@@ -156,9 +164,9 @@ body {
   <label class="flex items-center gap-2"><input id="replaceOriginals" type="checkbox" name="replace_originals" value="true" disabled> Replace originals after successful conversion</label>
 </fieldset>
 
-<div id="fileList" class="flex-1 overflow-y-auto p-6 space-y-3 text-sm text-gray-700"></div>
+<div id="fileList" class="p-6 space-y-6 text-sm text-gray-700"></div>
 
-<div class="p-6 border-t shrink-0">
+<div class="p-6 border-t shrink-0 sticky bottom-0 bg-white mt-auto">
 <button type="submit" class="w-full py-3 rounded-xl bg-emerald-600 text-white font-semibold hover:bg-emerald-700">
 Download Selected Files
 </button>
@@ -178,6 +186,10 @@ const errorBanner = document.getElementById("errorBanner");
 const downloadForm = document.querySelector("form[action='/download']");
 const downloadFrame = document.getElementById("downloadFrame");
 const fileList = document.getElementById("fileList");
+const drawer = document.getElementById("drawer");
+const fileTypeFilter = document.getElementById("fileTypeFilter");
+let drawerTrigger = null;
+let drawerRequest = 0;
 
 function logToTerminal(m){
   const line = document.createElement("p");
@@ -193,44 +205,153 @@ function showError(message){
 }
 
 async function openDrawer(id,name){
+  const request = ++drawerRequest;
+  drawerTrigger = document.activeElement;
   document.getElementById("drawerTitle").innerText=name;
   document.getElementById("activeCourseId").value=id;
   fileList.innerHTML="<p class='text-center text-gray-400'>Loading...</p>";
-  document.getElementById("drawer").classList.remove("translate-x-full");
+  fileTypeFilter.replaceChildren(new Option("All types", "all"));
+  updateSelectionCount();
+  drawer.inert = false;
+  drawer.setAttribute("aria-hidden", "false");
+  drawer.classList.remove("translate-x-full");
   document.getElementById("drawerOverlay").classList.remove("hidden");
+  document.querySelector("main").inert = true;
+  document.querySelector("header").inert = true;
+  document.getElementById("closeDrawerButton").focus();
   logToTerminal("Opening course: "+name);
 
-  const r = await fetch(`/api/courses/${id}/files`);
-  if(!r.ok){
+  try {
+    const r = await fetch(`/api/courses/${id}/files`);
     const data = await r.json();
-    showError(data.error || "Failed to fetch files.");
-    fileList.innerHTML="<p class='text-center text-gray-400'>No files available.</p>";
-    return;
+    if(request !== drawerRequest){return;}
+    if(!r.ok){throw new Error(data.error || "Failed to fetch files.");}
+    renderFiles(data);
+    logToTerminal(`Found ${data.length} files available for download.`);
+  } catch (error) {
+    if(request !== drawerRequest){return;}
+    fileList.textContent = "Could not load files. Close the picker and try again.";
+    logToTerminal(error.message || "Failed to fetch files.");
   }
-  const f = await r.json();
+}
+
+function typeLabel(type){
+  const names = {pdf: "PDF", doc: "Word (.doc)", docx: "Word (.docx)",
+    ppt: "PowerPoint (.ppt)", pptx: "PowerPoint (.pptx)", xls: "Excel (.xls)", xlsx: "Excel (.xlsx)",
+    txt: "Text (.txt)", jpg: "JPEG (.jpg)", jpeg: "JPEG (.jpeg)", png: "PNG", mp4: "Video (.mp4)"};
+  return type ? `${names[type] || type.toUpperCase()} — filename extension` : "Unknown type";
+}
+
+function typeFilterValue(type){
+  return type ? `extension:${type}` : "unknown";
+}
+
+function renderFiles(files){
   fileList.replaceChildren();
-  f.forEach((item)=>{
+  const types = [...new Set(files.map((item)=>item.file_type || ""))].sort();
+  types.forEach((type)=>fileTypeFilter.add(new Option(typeLabel(type), typeFilterValue(type))));
+  const groups = new Map();
+  files.forEach((item)=>{
+    // Missing post identities must not accidentally merge unrelated posts.
+    const key = JSON.stringify([item.source_kind, item.post_id || ["file", item.id]]);
+    if(!groups.has(key)){
+      const group = document.createElement("section");
+      group.dataset.postGroup = "";
+      const heading = document.createElement("h3");
+      const kind = {assignment: "Assignment", material: "Material", announcement: "Announcement"}[item.source_kind] || "Unknown source";
+      const title = item.post_title || kind;
+      heading.className = "font-semibold break-words";
+      heading.textContent = title;
+      const metadata = document.createElement("p");
+      metadata.className = "text-xs text-gray-600 mt-1";
+      const date = item.post_date ? new Date(item.post_date) : null;
+      metadata.textContent = `${kind} · ${date && !Number.isNaN(date.getTime()) ? date.toLocaleDateString(undefined, {dateStyle: "medium"}) : "Date unavailable"}`;
+      const actions = document.createElement("div");
+      actions.className = "flex flex-wrap gap-2 my-3 text-xs";
+      [true, false].forEach((checked)=>{
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = checked ? "Select visible" : "Clear visible";
+        button.setAttribute(checked ? "data-group-select" : "data-group-clear", "");
+        button.setAttribute("aria-label", `${button.textContent} files in ${kind}: ${title}`);
+        button.className = "rounded-lg border border-gray-200 px-3 py-2 hover:bg-gray-50";
+        button.addEventListener("click", ()=>{
+          group.querySelectorAll("[data-file-row]:not([hidden]) input").forEach((input)=>{input.checked = checked;});
+          updateSelectionCount();
+        });
+        actions.append(button);
+      });
+      group.append(heading, metadata, actions);
+      groups.set(key, group);
+      fileList.append(group);
+    }
     const label = document.createElement("label");
-    label.className = "block rounded-lg border p-3 hover:bg-gray-50";
+    label.dataset.fileRow = "";
+    label.dataset.fileType = typeFilterValue(item.file_type);
+    label.className = "flex items-start gap-2 border-t py-3 hover:bg-gray-50 break-words";
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
+    checkbox.className = "mt-1 shrink-0 accent-emerald-600";
     checkbox.checked = true;
     checkbox.name = "file_ids";
     checkbox.value = item.id;
-    label.append(checkbox, document.createTextNode(` ${item.name}`));
-    fileList.appendChild(label);
+    checkbox.addEventListener("change", updateSelectionCount);
+    const text = document.createElement("span");
+    text.className = "min-w-0";
+    text.append(document.createTextNode(item.name || "Untitled file"));
+    const type = document.createElement("span");
+    type.className = "block text-xs text-gray-600 mt-1";
+    type.textContent = typeLabel(item.file_type);
+    text.append(type);
+    label.append(checkbox, text);
+    groups.get(key).append(label);
   });
-  logToTerminal(`Found ${f.length} files available for download.`);
+  if(!files.length){fileList.textContent = "No files attached to this course.";}
+  filterFiles();
+}
+
+function filterFiles(){
+  fileList.querySelectorAll("[data-file-row]").forEach((row)=>{
+    row.hidden = fileTypeFilter.value !== "all" && row.dataset.fileType !== fileTypeFilter.value;
+  });
+  fileList.querySelectorAll("[data-post-group]").forEach((group)=>{
+    group.hidden = !group.querySelector("[data-file-row]:not([hidden])");
+  });
+  updateSelectionCount();
+}
+fileTypeFilter.addEventListener("change", filterFiles);
+
+function updateSelectionCount(){
+  const selected = [...fileList.querySelectorAll("input:checked")];
+  const hidden = selected.filter((input)=>input.closest("[data-file-row]").hidden).length;
+  document.getElementById("selectionCount").textContent = `${selected.length} selected · ${hidden} hidden by filter`;
 }
 function closeDrawer(){
- document.getElementById("drawer").classList.add("translate-x-full");
+ ++drawerRequest;
+ drawer.classList.add("translate-x-full");
  document.getElementById("drawerOverlay").classList.add("hidden");
+ drawer.inert = true;
+ drawer.setAttribute("aria-hidden", "true");
+ document.querySelector("main").inert = false;
+ document.querySelector("header").inert = false;
+ if(drawerTrigger){drawerTrigger.focus();}
 }
+
+drawer.addEventListener("keydown", (event)=>{
+  if(event.key === "Escape"){event.preventDefault(); closeDrawer();}
+  if(event.key !== "Tab"){return;}
+  const controls = [...drawer.querySelectorAll("button, input, select, [tabindex='0']")]
+    .filter((control)=>!control.disabled && control.type !== "hidden" && control.getClientRects().length);
+  const first = controls[0], last = controls[controls.length - 1];
+  if(event.shiftKey && document.activeElement === first){event.preventDefault(); last.focus();}
+  else if(!event.shiftKey && document.activeElement === last){event.preventDefault(); first.focus();}
+});
 
 function toggleAllFiles(checked){
   document.querySelectorAll("#fileList input[type='checkbox']").forEach((el)=>{
     el.checked = checked;
   });
+  updateSelectionCount();
 }
 
 const convertWord = document.getElementById("convertWord");

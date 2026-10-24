@@ -22,6 +22,21 @@ from gcr_downloader.models import (
 
 
 class WebAppTests(unittest.TestCase):
+    def test_file_api_preserves_ids_names_and_exposes_catalog_metadata_without_drive(self):
+        request = type("Request", (), {"session": {"token": {}}})()
+        files = [CourseFile("a", "Notes.pdf", "assignment", "post-1", "Week 1", None, "pdf")]
+        with mock.patch.object(main.Credentials, "from_authorized_user_info", return_value=object(), create=True), \
+             mock.patch.object(main, "build", return_value=object()) as build, \
+             mock.patch.object(main, "list_course_files", return_value=files):
+            result = main.get_course_files(request, "course-1")
+        self.assertEqual(result, [{
+            "id": "a", "name": "Notes.pdf", "source_kind": "assignment", "post_id": "post-1",
+            "post_title": "Week 1", "post_date": None, "file_type": "pdf",
+            "file_type_source": "extension",
+        }])
+        self.assertEqual(build.call_count, 1)
+        self.assertEqual(build.call_args.args[:2], ("classroom", "v1"))
+
     def test_safe_filename_rejects_dot_path_components(self):
         self.assertEqual(drive.safe_filename("."), "file")
         self.assertEqual(drive.safe_filename(".."), "file")

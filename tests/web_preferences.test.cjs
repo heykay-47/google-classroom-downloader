@@ -11,11 +11,11 @@ const optionNames = ['skip_videos', 'convert_word', 'convert_powerpoint', 'repla
 
 // A DOM boundary harness: execute the actual page script and interact via controls/events.
 function page(storage = new Map()) {
-  function element() {
+  function element(tagName = '') {
     const listeners = {};
     const classes = new Set();
     return {
-      checked: false, disabled: false, value: '', children: [], dataset: {},
+      tagName, checked: false, disabled: false, hidden: false, value: '', children: [], dataset: {},
       classList: {
         add: (name) => classes.add(name), remove: (name) => classes.delete(name),
         contains: (name) => classes.has(name),
@@ -23,13 +23,39 @@ function page(storage = new Map()) {
       },
       addEventListener(name, handler) { (listeners[name] ??= []).push(handler); },
       dispatch(name, event = {}) { for (const handler of listeners[name] || []) handler(event); },
-      append(...items) { this.children.push(...items); },
-      appendChild(item) { this.children.push(item); },
-      replaceChildren(...items) { this.children = items; },
-      setAttribute(name, value) { this[name] = value; },
+      append(...items) { for (const item of items) { item.parentElement = this; this.children.push(item); } },
+      appendChild(item) { this.append(item); },
+      add(item) { this.append(item); },
+      replaceChildren(...items) {
+        this.children = []; this.append(...items);
+        if (this.tagName === 'select') this.value = items[0]?.value || '';
+      },
+      setAttribute(name, value) {
+        this[name] = value;
+        if (name.startsWith('data-')) this.dataset[name.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = value;
+      },
+      focus() { document.activeElement = this; },
+      closest(selector) {
+        for (let node = this; node; node = node.parentElement) if (matches(node, selector)) return node;
+        return null;
+      },
+      querySelectorAll(selector) { return descendants(this).filter((node) => matches(node, selector)); },
+      querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
     };
   }
+  function descendants(node) {
+    return (node.children || []).flatMap((child) => [child, ...descendants(child)]);
+  }
+  function matches(node, selector) {
+    if (selector === 'input:checked') return node.tagName === 'input' && node.checked;
+    if (selector === '[data-post-group]') return 'postGroup' in (node.dataset || {});
+    if (selector === '[data-file-row]') return 'fileRow' in (node.dataset || {});
+    if (selector === '[data-file-row]:not([hidden])') return matches(node, '[data-file-row]') && !node.hidden;
+    if (selector === '[data-file-row]:not([hidden]) input') return node.tagName === 'input' && !node.parentElement.hidden;
+    return false;
+  }
   const ids = Object.fromEntries([...template.matchAll(/id="([^"]+)"/g)].map((match) => [match[1], element()]));
+  ids.fileTypeFilter.tagName = 'select';
   const options = Object.fromEntries(optionNames.map((name) => {
     const tag = template.match(new RegExp(`<input[^>]*name="${name}"[^>]*>`))[0];
     const id = tag.match(/id="([^"]+)"/)?.[1];
@@ -38,13 +64,15 @@ function page(storage = new Map()) {
     control.disabled = /\sdisabled(?:\s|>)/.test(tag);
     return [name, control];
   }));
-  const files = () => ids.fileList.children.flatMap((label) => label.children || [])
+  const files = () => descendants(ids.fileList)
     .filter((control) => control.name === 'file_ids');
   const form = element();
+  const main = element(), header = element();
   form.querySelectorAll = () => files().filter((control) => control.checked);
   const document = {
     getElementById: (id) => ids[id],
     querySelector: (selector) => selector === "form[action='/download']" ? form
+      : selector === 'main' ? main : selector === 'header' ? header
       : options[selector.match(/name=['"]([^'"]+)/)?.[1]],
     querySelectorAll: (selector) => selector.startsWith('#fileList') ? files() : [],
     createElement: element, createTextNode: (text) => ({ textContent: text }),
@@ -53,6 +81,7 @@ function page(storage = new Map()) {
   const requests = [];
   const context = vm.createContext({
     document,
+    Option: function(text, value) { return { textContent: text, value }; },
     get localStorage() {
       if (storage instanceof Error) throw storage;
       return { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) };
