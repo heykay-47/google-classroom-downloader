@@ -329,16 +329,29 @@ def download_all_for_course(
     report: DownloadReport,
     libreoffice_cmd: str = "",
     dry_run: bool = False,
+    course_position: int = 1,
+    course_count: int = 1,
 ) -> None:
     base_path = base_dir.resolve()
     course_dir = base_path / safe_filename(course.name)
+    course_files = list_course_files(classroom_service, course.id)
+    total_files = len(course_files)
+    print(f"\nCourse [{course_position}/{course_count}] {course.name}: {total_files} discovered files", flush=True)
+    if not course_files:
+        print("  No files to process.")
 
     def record(result: ItemResult) -> None:
         report.add(result)
         if not dry_run:
             save_index(downloaded_ids)
+        outcome = result.status.replace("_", " ").capitalize()
+        if result.status == "dry_run":
+            outcome = "Dry run (planned, not downloaded)"
+        detail = f" - {result.message}" if result.message else ""
+        print(f"  [{file_position}/{total_files}] {outcome}: {result.source_name}{detail}", flush=True)
 
-    for course_file in list_course_files(classroom_service, course.id):
+    for file_position, course_file in enumerate(course_files, 1):
+        print(f"  [{file_position}/{total_files}] Processing: {course_file.title_hint}", flush=True)
         metadata = None
         for attempt in range(3):
             try:
@@ -617,7 +630,7 @@ def run_downloads(args, downloaded_ids: Dict[str, str], report: DownloadReport) 
         convert_powerpoint=conversion_prefs["convert_ppt"],
         keep_originals=not conversion_prefs["delete_originals"],
     )
-    for course in selected_courses:
+    for course_position, course in enumerate(selected_courses, 1):
         download_all_for_course(
             classroom_service,
             drive_service,
@@ -628,6 +641,8 @@ def run_downloads(args, downloaded_ids: Dict[str, str], report: DownloadReport) 
             report,
             libreoffice_cmd=libreoffice_cmd,
             dry_run=args.dry_run,
+            course_position=course_position,
+            course_count=len(selected_courses),
         )
     render_report(report)
     return 0
