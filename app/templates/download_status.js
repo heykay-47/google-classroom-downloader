@@ -26,8 +26,8 @@
     try {
       const doc = attempt.frame.contentDocument;
       const error = doc && doc.querySelector("[data-download-error]");
-      if(error && error.dataset.downloadToken === attempt.token){
-        finish(attempt, error.textContent, true);
+      if(error){
+        if(error.dataset.downloadToken === attempt.token){finish(attempt, error.textContent, true);}
       } else if(loaded && doc && doc.body && doc.body.textContent.trim()){
         // Framework/proxy HTTP errors may not carry our HTML error envelope.
         finish(attempt, "The download request was rejected. Check your selection and retry, or sign in again.", true);
