@@ -39,11 +39,18 @@ DEFAULT_DOWNLOAD_DIR = "downloads"
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError, TransportError
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 
 # ---------- AUTH HELPERS ----------
+
+
+def has_required_scopes(creds: Credentials) -> bool:
+    # has_scopes() checks requested scopes, not a server's partial grant.
+    scopes = creds.granted_scopes if creds.granted_scopes is not None else creds.scopes
+    return set(SCOPES).issubset(scopes or ())
 
 
 def get_credentials() -> Credentials:
@@ -52,19 +59,53 @@ def get_credentials() -> Credentials:
     """
     creds = None
     if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE)
+        if not has_required_scopes(creds):
+            creds = None
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except RefreshError as exc:
+                details = exc.args[1] if len(exc.args) > 1 else None
+                if exc.retryable or not isinstance(details, dict) or details.get("error") != "invalid_grant":
+                    raise ValueError(
+                        "Could not refresh Google credentials; saved token unchanged. "
+                        "Check your connection and Google service status, then retry. "
+                        "If this persists, check the OAuth client configuration in credentials.json."
+                    ) from None
+                creds = None
+            except TransportError:
+                raise ValueError(
+                    "Network failure during Google credential refresh; saved token unchanged. "
+                    "Check your connection and retry."
+                ) from None
+        if not creds or not creds.valid or not has_required_scopes(creds):
             if not os.path.exists("credentials.json"):
                 raise FileNotFoundError(
                     "credentials.json not found. "
                     "Download it from Google Cloud Console and place it next to this script."
                 )
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
+            print("Opening Google sign-in. Allow all requested permissions; press Ctrl+C to cancel.")
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+                creds = flow.run_local_server(port=0, timeout_seconds=180, prompt="consent")
+            except KeyboardInterrupt:
+                raise ValueError(
+                    "Google sign-in cancelled; run the command again when ready. Saved token unchanged."
+                ) from None
+            except Exception:
+                # OAuth exceptions can contain token endpoint responses or callback URLs.
+                raise ValueError(
+                    "Google sign-in failed or timed out; check your connection and credentials.json, "
+                    "then run the command again. Saved token unchanged."
+                ) from None
+            if not creds or not creds.valid or not has_required_scopes(creds):
+                raise ValueError(
+                    "Google sign-in did not grant all required permissions; "
+                    "run the command again and allow every requested permission. Saved token unchanged."
+                )
         with open(TOKEN_FILE, "w") as token:
             token.write(creds.to_json())
 
