@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,12 +20,24 @@ class DrawerBrowserTests(unittest.TestCase):
         if not shutil.which("agent-browser"):
             raise unittest.SkipTest("agent-browser not installed")
         cls.session = subprocess.check_output(
-            ["agent-browser", "session", "id", "--scope", "worktree", "--prefix", "issue-7"], text=True,
+            ["agent-browser", "session", "id", "--scope", "worktree", "--prefix", "drawer"], text=True,
         ).strip()
+        output_dir = os.environ.get("GCR_BROWSER_OUTPUT_DIR")
+        if output_dir:
+            cls.output = Path(output_dir)
+            cls.output.mkdir(parents=True, exist_ok=True)
+        else:
+            temporary_output = tempfile.TemporaryDirectory(prefix="gcr-drawer-")
+            cls.addClassCleanup(temporary_output.cleanup)
+            cls.output = Path(temporary_output.name)
         env = Environment(loader=FileSystemLoader("app/templates"), autoescape=select_autoescape())
         html = env.get_template("courses.html").render(courses=[{
             "id": "course-1", "name": "Browser fixture", "state": "ACTIVE",
         }]).encode()
+        tailwind_path = os.environ.get("GCR_BROWSER_TAILWIND_JS")
+        tailwind = Path(tailwind_path).read_bytes() if tailwind_path else None
+        if tailwind is not None:
+            html = html.replace(b'https://cdn.tailwindcss.com', b'/fixture-tailwind.js')
         files = [
             {"id": "a", "name": "Notes.pdf", "source_kind": "assignment", "post_id": "1",
              "post_title": "Week 1", "post_date": "2026-10-01T12:00:00Z", "file_type": "pdf"},
@@ -38,6 +51,12 @@ class DrawerBrowserTests(unittest.TestCase):
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
+                if self.path == "/fixture-tailwind.js" and tailwind is not None:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/javascript")
+                    self.end_headers()
+                    self.wfile.write(tailwind)
+                    return
                 api = self.path.endswith("/files")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json" if api else "text/html")
@@ -77,7 +96,10 @@ class DrawerBrowserTests(unittest.TestCase):
 
     def test_filter_group_selection_submission_keyboard_and_mobile(self):
         self.browser("open", f"http://127.0.0.1:{self.server.server_port}")
+        self.browser("wait", "--fn", "getComputedStyle(document.getElementById('drawer')).position === 'fixed'")
+        self.assertEqual(self.evaluate("getComputedStyle(document.getElementById('drawer')).position"), "fixed")
         self.browser("click", "[data-manage-files]")
+        self.browser("wait", "--fn", "document.getElementById('drawer').getBoundingClientRect().right <= innerWidth")
         self.browser("wait", "[data-post-group]")
         self.assertEqual(self.evaluate("document.querySelectorAll('[data-post-group]').length"), 3)
         self.assertIn("4 selected", self.evaluate("document.getElementById('selectionCount').textContent"))
@@ -103,6 +125,7 @@ class DrawerBrowserTests(unittest.TestCase):
         self.assertTrue(self.evaluate("document.activeElement.matches('[data-manage-files]')"))
         self.browser("press", "Enter")
         self.browser("wait", "#fileList input")
+        self.browser("wait", "--fn", "document.getElementById('drawer').getBoundingClientRect().right <= innerWidth")
         self.assertEqual(self.evaluate("document.activeElement.id"), "closeDrawerButton")
         self.browser("focus", "input[name='file_ids'][value='a']")
         self.browser("press", "Space")
@@ -117,13 +140,13 @@ class DrawerBrowserTests(unittest.TestCase):
         self.browser("select", "#fileTypeFilter", "extension:pdf")
         self.assertTrue(self.evaluate("document.getElementById('drawer').getBoundingClientRect().right <= innerWidth"))
         self.assertTrue(self.evaluate("document.getElementById('drawer').scrollWidth <= innerWidth"))
-        evidence = Path("/tmp/opencode/gcr-issue-7-mobile.png")
+        evidence = self.output / "drawer-mobile.png"
         self.browser("scrollintoview", "[data-post-group]:first-child [data-group-select]")
         self.browser("screenshot", str(evidence))
         self.browser("set", "viewport", "1280", "900")
         self.browser("scrollintoview", "#selectCourseFiles")
-        self.browser("screenshot", "/tmp/opencode/gcr-issue-7-desktop.png")
-        Path("/tmp/opencode/gcr-issue-7-browser.txt").write_text(self.browser("snapshot"), encoding="utf-8")
+        self.browser("screenshot", str(self.output / "drawer-desktop.png"))
+        (self.output / "drawer-browser.txt").write_text(self.browser("snapshot"), encoding="utf-8")
 
 
 if __name__ == "__main__":

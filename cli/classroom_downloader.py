@@ -165,6 +165,27 @@ def save_index(downloaded_ids: Dict[str, str]) -> None:
             temp_path.unlink(missing_ok=True)
 
 
+def backup_corrupt_index() -> pathlib.Path:
+    index_path = pathlib.Path(INDEX_FILE).resolve()
+    temp_path = None
+    try:
+        with index_path.open("rb") as source, tempfile.NamedTemporaryFile(
+            mode="wb", dir=index_path.parent,
+            prefix=f".{index_path.name}.", suffix=".tmp", delete=False,
+        ) as backup:
+            temp_path = pathlib.Path(backup.name)
+            shutil.copyfileobj(source, backup)
+            backup.flush()
+            os.fsync(backup.fileno())
+        backup_path = temp_path.with_suffix(".corrupt.bak")
+        # Publish complete bytes atomically, failing rather than replacing any backup.
+        os.link(temp_path, backup_path)
+        return backup_path
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def get_indexed_path(base_dir: pathlib.Path, stored_path: str) -> pathlib.Path | None:
     if not stored_path:
         return None
@@ -381,7 +402,7 @@ def download_all_for_course(
     if not course_files:
         print("  No files to process.")
 
-    def record(result: ItemResult) -> None:
+    def record(file_position: int, result: ItemResult) -> None:
         report.add(result)
         if not dry_run:
             save_index(downloaded_ids)
@@ -405,7 +426,7 @@ def download_all_for_course(
                 if attempt < 2:
                     time.sleep(2**attempt)
         if metadata is None:
-            record(ItemResult(course.name, course_file.title_hint, "download_failed", message="Failed to fetch file metadata"))
+            record(file_position, ItemResult(course.name, course_file.title_hint, "download_failed", message="Failed to fetch file metadata"))
             continue
 
         source_name = ensure_extension(
@@ -413,7 +434,7 @@ def download_all_for_course(
             metadata.get("mimeType"),
         )
         if not options.include_videos and is_video_file(source_name, metadata.get("mimeType")):
-            record(ItemResult(course.name, source_name, "skipped_video", message="Video excluded"))
+            record(file_position, ItemResult(course.name, source_name, "skipped_video", message="Video excluded"))
             continue
 
         indexed_path = get_indexed_path(base_path, downloaded_ids.get(course_file.id, ""))
@@ -431,7 +452,7 @@ def download_all_for_course(
                 or conversion_kind(source_name, options) is None
                 or indexed_path.suffix.lower() == ".pdf"
             ):
-                record(ItemResult(course.name, source_name, "skipped_existing", (relative,), "File already exists"))
+                record(file_position, ItemResult(course.name, source_name, "skipped_existing", (relative,), "File already exists"))
                 continue
             destination = indexed_path
             relative_destination = relative
@@ -448,7 +469,7 @@ def download_all_for_course(
                     metadata.get("mimeType"),
                     dry_run=True,
                 )
-                record(ItemResult(course.name, source_name, "dry_run", (relative_destination,)))
+                record(file_position, ItemResult(course.name, source_name, "dry_run", (relative_destination,)))
                 continue
 
             if not download_drive_file(
@@ -457,7 +478,7 @@ def download_all_for_course(
                 destination,
                 metadata.get("mimeType"),
             ):
-                record(ItemResult(course.name, source_name, "download_failed", message="Download failed after three attempts"))
+                record(file_position, ItemResult(course.name, source_name, "download_failed", message="Download failed after three attempts"))
                 continue
             destination = collapse_identical_duplicate(
                 destination,
@@ -467,7 +488,7 @@ def download_all_for_course(
 
         downloaded_ids[course_file.id] = relative_destination
         if conversion_kind(source_name, options) is None:
-            record(ItemResult(course.name, source_name, "downloaded", (relative_destination,)))
+            record(file_position, ItemResult(course.name, source_name, "downloaded", (relative_destination,)))
             continue
 
         existing_pdf = destination.with_suffix(".pdf")
@@ -476,7 +497,7 @@ def download_all_for_course(
         else:
             pdf_path, error = convert_to_pdf(destination, libreoffice_cmd)
         if pdf_path is None:
-            record(ItemResult(course.name, source_name, "conversion_failed", (relative_destination,), error))
+            record(file_position, ItemResult(course.name, source_name, "conversion_failed", (relative_destination,), error))
             continue
 
         relative_pdf = pdf_path.relative_to(base_path).as_posix()
@@ -485,11 +506,11 @@ def download_all_for_course(
             try:
                 destination.unlink()
             except OSError:
-                record(ItemResult(course.name, source_name, "conversion_failed", outputs, "Converted PDF created but original could not be removed"))
+                record(file_position, ItemResult(course.name, source_name, "conversion_failed", outputs, "Converted PDF created but original could not be removed"))
                 continue
             downloaded_ids[course_file.id] = relative_pdf
             outputs = (relative_pdf,)
-        record(ItemResult(course.name, source_name, "converted", outputs))
+        record(file_position, ItemResult(course.name, source_name, "converted", outputs))
 
 
 # ---------- MAIN / CLI ----------
@@ -610,7 +631,23 @@ def main() -> int:
     report = DownloadReport()
     try:
         print("Loading download index...")
-        downloaded_ids = load_index()
+        try:
+            downloaded_ids = load_index()
+        except ValueError as exc:
+            if args.dry_run or not sys.stdin.isatty():
+                raise
+            print(f"Warning: {exc}")
+            try:
+                confirmed = prompt_yes_no(
+                    "Preserve a private backup and proceed with an empty index (may redownload files)? (y/n): "
+                )
+            except EOFError:
+                confirmed = False
+            if not confirmed:
+                raise ValueError("Index recovery declined. Original left unchanged.") from None
+            backup_path = backup_corrupt_index()
+            print(f"Corrupt index preserved in private backup: {backup_path}")
+            downloaded_ids = {}
         return run_downloads(args, downloaded_ids, report)
     except KeyboardInterrupt:
         print("\nDownload interrupted. Showing partial results.")

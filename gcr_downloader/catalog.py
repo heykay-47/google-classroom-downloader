@@ -6,7 +6,7 @@ the web app and the local CLI.
 from pathlib import PurePosixPath
 
 from gcr_downloader.files import validate_course_id, validate_file_id
-from gcr_downloader.models import Course, CourseFile
+from gcr_downloader.models import Course, CourseFile, SourceKind
 
 
 class CatalogError(RuntimeError):
@@ -65,7 +65,7 @@ def list_course_files(classroom, course_id: str) -> list[CourseFile]:
     files: list[CourseFile] = []
     seen: set[str] = set()
 
-    def collect(payload: dict, key: str, fallback: str, source_kind: str) -> None:
+    def collect(payload: dict, key: str, fallback: str, source_kind: SourceKind) -> None:
         for post in payload.get(key, []):
             title = post.get("title") or fallback
             for material in post.get("materials", []):

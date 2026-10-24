@@ -58,7 +58,8 @@
     frame.addEventListener("load", () => inspectError(attempt, true));
     document.body.append(frame);
     downloadForm.setAttribute("target", frame.name);
-    downloadForm.setAttribute("action", `/download?download_token=${token}`);
+    const deadline = Math.floor((attempt.started + timeoutMs) / 1000);
+    downloadForm.setAttribute("action", `/download?download_token=${token}&download_deadline=${deadline}`);
     submit.disabled = true;
     function poll(){
       if(active !== attempt){return;}

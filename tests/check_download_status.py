@@ -5,6 +5,7 @@ import base64
 import json
 from urllib.parse import urlencode
 from unittest.mock import patch
+from email.utils import parsedate_to_datetime
 
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -22,7 +23,7 @@ class DownloadStatusHTTPTests(unittest.TestCase):
         value = base64.b64encode(json.dumps({"token": {}}).encode())
         self.cookie = "classroom_session_v5=" + middleware.signer.sign(value).decode()
 
-    def post(self, token=TOKEN, data=None):
+    def post(self, token=TOKEN, data=None, deadline=None):
         events = []
         body = urlencode(data or {"course_id": "c", "file_ids": "f"}).encode()
 
@@ -32,9 +33,12 @@ class DownloadStatusHTTPTests(unittest.TestCase):
         async def send(event):
             events.append(event)
 
+        query = {"download_token": token}
+        if deadline is not None:
+            query["download_deadline"] = deadline
         scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
                  "method": "POST", "path": "/download", "raw_path": b"/download",
-                 "query_string": f"download_token={token}".encode(), "scheme": "http",
+                 "query_string": urlencode(query).encode(), "scheme": "http",
                  "server": ("localhost", 80), "client": ("127.0.0.1", 1234),
                  "headers": [(b"host", b"localhost"), (b"content-type", b"application/x-www-form-urlencoded"),
                              (b"cookie", self.cookie.encode())]}
@@ -54,7 +58,7 @@ class DownloadStatusHTTPTests(unittest.TestCase):
         self.assertIn("attachment", dict(headers)["content-disposition"])
         status = next(v for k, v in headers if k == "set-cookie" and v.startswith("download_status_"))
         self.assertIn(f"download_status_{TOKEN}=ready", status)
-        self.assertIn("Max-Age=300", status)
+        self.assertRegex(status, r"Max-Age=(299|300)(?:;|$)")
         self.assertIn("SameSite=lax", status)
         self.assertNotIn("HttpOnly", status)
         self.assertNotIn("Secure", status)
@@ -69,6 +73,44 @@ class DownloadStatusHTTPTests(unittest.TestCase):
         self.assertIn("Sign in again", body)
         self.assertNotIn("location", dict(headers))
         self.assertNotIn("download_status_", str(headers))
+
+    def test_delayed_preparation_cookie_expires_by_original_browser_deadline(self):
+        from starlette.responses import Response
+        from http.cookies import SimpleCookie
+
+        with patch.object(main, "_download_response", return_value=Response()), \
+             patch.object(main, "time", side_effect=[1000, 1301]):
+            code, headers, _ = self.post(deadline="1300")
+        self.assertEqual(code, 200)
+        cookie = SimpleCookie(next(v for k, v in headers if k == "set-cookie" and v.startswith("download_status_")))
+        status = cookie[f"download_status_{TOKEN}"]
+        self.assertEqual(status["max-age"], "0")
+        self.assertEqual(parsedate_to_datetime(status["expires"]).timestamp(), 1300)
+
+    def test_deadline_is_clamped_and_shortened_by_preparation_time(self):
+        from starlette.responses import Response
+        from http.cookies import SimpleCookie
+
+        for requested, expected, responded in (("9999999999999999", 1300, 1100), ("1200", 1200, 1100), ("0", 0, 1100), (None, 1300, 1100), (None, 1300, 900)):
+            with self.subTest(requested=requested, responded=responded):
+                with patch.object(main, "_download_response", return_value=Response()), \
+                     patch.object(main, "time", side_effect=[1000, responded]):
+                    code, headers, _ = self.post(deadline=requested)
+                self.assertEqual(code, 200)
+                cookie = SimpleCookie(next(v for k, v in headers if k == "set-cookie" and v.startswith("download_status_")))
+                status = cookie[f"download_status_{TOKEN}"]
+                self.assertEqual(status["max-age"], str(max(0, min(300, expected - responded))))
+                self.assertEqual(parsedate_to_datetime(status["expires"]).timestamp(), expected)
+
+    def test_invalid_deadline_returns_correlated_error_without_preparation(self):
+        for deadline in ("nan", "inf", "-1", "1.5", "", "9" * 100):
+            with self.subTest(deadline=deadline), patch.object(main, "_download_response") as prepare:
+                code, headers, body = self.post(deadline=deadline)
+                self.assertEqual(code, 400)
+                self.assertIn(TOKEN, body)
+                self.assertIn("Retry", body)
+                self.assertNotIn("download_status_", str(headers))
+                prepare.assert_not_called()
 
     def test_invalid_selection_returns_correlated_error(self):
         code, _, body = self.post(data={"course_id": "c"})

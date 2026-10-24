@@ -2,7 +2,9 @@ import os
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from html import escape
+from time import time
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -139,10 +141,18 @@ def download(
     replace_originals: bool = Form(False),
 ):
     # Optional browser handshake. Legacy/direct callers retain their response contract.
-    token = getattr(request, "query_params", {}).get("download_token")
+    token = request.query_params.get("download_token")
     if token is not None and not re.fullmatch(r"[a-f0-9]{32}", token):
         raise HTTPException(status_code=400, detail="Invalid download token")
     try:
+        if token:
+            deadline = time() + 300
+            requested_deadline = request.query_params.get("download_deadline")
+            if requested_deadline is not None:
+                if not re.fullmatch(r"[0-9]{1,16}", requested_deadline):
+                    raise HTTPException(status_code=400, detail="Invalid download deadline. Retry the download.")
+                deadline = min(deadline, int(requested_deadline))
+        # Handshake callers need an actionable 401, not the legacy login redirect.
         if token and "token" not in request.session:
             raise HTTPException(status_code=401, detail="Your session expired. Sign in again, then retry the download.")
         response = _download_response(request, course_id, file_ids, skip_videos,
@@ -163,8 +173,12 @@ def download(
             status_code=status, headers={"Cache-Control": "no-store"},
         )
     if token:
-        response.set_cookie(f"download_status_{token}", "ready", max_age=300,
-                            secure=not IS_LOCAL, httponly=False, samesite="lax", path="/")
+        response.set_cookie(
+            f"download_status_{token}", "ready",
+            max_age=max(0, min(300, int(deadline - time()))),
+            expires=datetime.fromtimestamp(deadline, timezone.utc),
+            secure=not IS_LOCAL, httponly=False, samesite="lax", path="/",
+        )
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -214,7 +228,6 @@ def get_course_files(request: Request, course_id: str):
             "post_title": item.post_title,
             "post_date": item.post_date,
             "file_type": item.file_type,
-            "file_type_source": "extension" if item.file_type else None,
         } for item in files]
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
