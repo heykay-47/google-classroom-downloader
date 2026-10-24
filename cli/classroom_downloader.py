@@ -39,11 +39,18 @@ DEFAULT_DOWNLOAD_DIR = "downloads"
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError, TransportError
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 
 # ---------- AUTH HELPERS ----------
+
+
+def has_required_scopes(creds: Credentials) -> bool:
+    # has_scopes() checks requested scopes, not a server's partial grant.
+    scopes = creds.granted_scopes if creds.granted_scopes is not None else creds.scopes
+    return set(SCOPES).issubset(scopes or ())
 
 
 def get_credentials() -> Credentials:
@@ -52,19 +59,53 @@ def get_credentials() -> Credentials:
     """
     creds = None
     if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE)
+        if not has_required_scopes(creds):
+            creds = None
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except RefreshError as exc:
+                details = exc.args[1] if len(exc.args) > 1 else None
+                if exc.retryable or not isinstance(details, dict) or details.get("error") != "invalid_grant":
+                    raise ValueError(
+                        "Could not refresh Google credentials; saved token unchanged. "
+                        "Check your connection and Google service status, then retry. "
+                        "If this persists, check the OAuth client configuration in credentials.json."
+                    ) from None
+                creds = None
+            except TransportError:
+                raise ValueError(
+                    "Network failure during Google credential refresh; saved token unchanged. "
+                    "Check your connection and retry."
+                ) from None
+        if not creds or not creds.valid or not has_required_scopes(creds):
             if not os.path.exists("credentials.json"):
                 raise FileNotFoundError(
                     "credentials.json not found. "
                     "Download it from Google Cloud Console and place it next to this script."
                 )
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
+            print("Opening Google sign-in. Allow all requested permissions; press Ctrl+C to cancel.")
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+                creds = flow.run_local_server(port=0, timeout_seconds=180, prompt="consent")
+            except KeyboardInterrupt:
+                raise ValueError(
+                    "Google sign-in cancelled; run the command again when ready. Saved token unchanged."
+                ) from None
+            except Exception:
+                # OAuth exceptions can contain token endpoint responses or callback URLs.
+                raise ValueError(
+                    "Google sign-in failed or timed out; check your connection and credentials.json, "
+                    "then run the command again. Saved token unchanged."
+                ) from None
+            if not creds or not creds.valid or not has_required_scopes(creds):
+                raise ValueError(
+                    "Google sign-in did not grant all required permissions; "
+                    "run the command again and allow every requested permission. Saved token unchanged."
+                )
         with open(TOKEN_FILE, "w") as token:
             token.write(creds.to_json())
 
@@ -329,16 +370,29 @@ def download_all_for_course(
     report: DownloadReport,
     libreoffice_cmd: str = "",
     dry_run: bool = False,
+    course_position: int = 1,
+    course_count: int = 1,
 ) -> None:
     base_path = base_dir.resolve()
     course_dir = base_path / safe_filename(course.name)
+    course_files = list_course_files(classroom_service, course.id)
+    total_files = len(course_files)
+    print(f"\nCourse [{course_position}/{course_count}] {course.name}: {total_files} discovered files", flush=True)
+    if not course_files:
+        print("  No files to process.")
 
     def record(result: ItemResult) -> None:
         report.add(result)
         if not dry_run:
             save_index(downloaded_ids)
+        outcome = result.status.replace("_", " ").capitalize()
+        if result.status == "dry_run":
+            outcome = "Dry run (planned, not downloaded)"
+        detail = f" - {result.message}" if result.message else ""
+        print(f"  [{file_position}/{total_files}] {outcome}: {result.source_name}{detail}", flush=True)
 
-    for course_file in list_course_files(classroom_service, course.id):
+    for file_position, course_file in enumerate(course_files, 1):
+        print(f"  [{file_position}/{total_files}] Processing: {course_file.title_hint}", flush=True)
         metadata = None
         for attempt in range(3):
             try:
@@ -617,7 +671,7 @@ def run_downloads(args, downloaded_ids: Dict[str, str], report: DownloadReport) 
         convert_powerpoint=conversion_prefs["convert_ppt"],
         keep_originals=not conversion_prefs["delete_originals"],
     )
-    for course in selected_courses:
+    for course_position, course in enumerate(selected_courses, 1):
         download_all_for_course(
             classroom_service,
             drive_service,
@@ -628,6 +682,8 @@ def run_downloads(args, downloaded_ids: Dict[str, str], report: DownloadReport) 
             report,
             libreoffice_cmd=libreoffice_cmd,
             dry_run=args.dry_run,
+            course_position=course_position,
+            course_count=len(selected_courses),
         )
     render_report(report)
     return 0
