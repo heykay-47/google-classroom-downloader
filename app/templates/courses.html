@@ -159,14 +159,13 @@ body {
 <div id="fileList" class="flex-1 overflow-y-auto p-6 space-y-3 text-sm text-gray-700"></div>
 
 <div class="p-6 border-t shrink-0">
+<p id="downloadStatus" role="status" aria-live="polite" class="mb-3 text-sm text-gray-600"></p>
 <button type="submit" class="w-full py-3 rounded-xl bg-emerald-600 text-white font-semibold hover:bg-emerald-700">
 Download Selected Files
 </button>
 </div>
 </form>
 </div>
-
-<iframe id="downloadFrame" name="downloadFrame" class="hidden"></iframe>
 
 <script>
 const terminal = document.getElementById("terminal");
@@ -176,7 +175,6 @@ const searchInput = document.getElementById("courseSearch");
 const courseCount = document.getElementById("courseCount");
 const errorBanner = document.getElementById("errorBanner");
 const downloadForm = document.querySelector("form[action='/download']");
-const downloadFrame = document.getElementById("downloadFrame");
 const fileList = document.getElementById("fileList");
 
 function logToTerminal(m){
@@ -299,27 +297,7 @@ async function hydrateFileCounts(){
   await Promise.all(requests);
 }
 
-let downloadInProgress = false;
-
-downloadForm.addEventListener("submit", (event) => {
-  const selectedFiles = downloadForm.querySelectorAll("input[name='file_ids']:checked");
-  if(selectedFiles.length === 0){
-    event.preventDefault();
-    showError("Select at least one file to download.");
-    logToTerminal("Download cancelled: no files selected.");
-    return;
-  }
-  downloadForm.setAttribute("target", "downloadFrame");
-  downloadInProgress = true;
-  logToTerminal("Starting download...");
-});
-
-downloadFrame.addEventListener("load", () => {
-  if(downloadInProgress){
-    downloadInProgress = false;
-    logToTerminal("Download response complete.");
-  }
-});
+{% include "download_status.js" %}
 
 searchInput.addEventListener("input", filterCourses);
 
