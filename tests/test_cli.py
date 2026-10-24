@@ -77,6 +77,104 @@ class CliDownloaderTests(unittest.TestCase):
             code = downloader.main()
         return code, output.getvalue()
 
+    def test_progress_shows_selected_course_positions_and_empty_counts(self):
+        courses = [Course("empty", "Empty", "ACTIVE"), Course("full", "Full", "ACTIVE")]
+        with tempfile.TemporaryDirectory() as directory:
+            drive = mock.Mock()
+            drive.files.return_value.get.return_value.execute.return_value = {
+                "name": "notes.pdf", "mimeType": "application/pdf",
+            }
+            with mock.patch.object(downloader, "list_courses", return_value=courses), \
+                 mock.patch.object(downloader, "list_course_files", side_effect=[[], [CourseFile("id", "notes.pdf")]]) as catalog:
+                output = io.StringIO()
+                with mock.patch.object(sys, "argv", ["gcr", "--base-dir", directory]), \
+                     mock.patch.object(downloader, "get_credentials", return_value=object()), \
+                     mock.patch.object(downloader, "build", side_effect=[object(), drive]), \
+                     mock.patch.object(downloader, "MediaIoBaseDownload", SuccessfulDownloader), \
+                     mock.patch("builtins.input", side_effect=["all", "n", "n", "y"]), \
+                     mock.patch("sys.stdout", output):
+                    self.assertEqual(downloader.main(), 0)
+            self.assertEqual([call.args[1] for call in catalog.call_args_list], ["empty", "full"])
+            text = output.getvalue()
+            self.assertIn("Course [1/2] Empty: 0 discovered files", text)
+            self.assertIn("No files to process.", text)
+            self.assertIn("Course [2/2] Full: 1 discovered files", text)
+            self.assertIn("[1/1] Downloaded: notes.pdf", text)
+            self.assertIn("Download summary:", text)
+
+    def test_progress_reports_each_mixed_outcome_with_reason(self):
+        names = ["notes.pdf", "slides.pptx", "broken.pptx", "video.mp4", "existing.pdf", "failed.pdf", "unknown.pdf"]
+        files = [CourseFile(name, name) for name in names]
+        drive = mock.Mock()
+
+        def metadata(*, fileId, **_kwargs):
+            if fileId == "unknown.pdf":
+                raise RuntimeError("metadata unavailable")
+            request = mock.Mock()
+            request.execute.return_value = {"name": fileId, "mimeType": "application/octet-stream"}
+            return request
+
+        def download(_drive, file_id, destination, _mime_type):
+            if file_id == "failed.pdf":
+                return False
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"source")
+            return True
+
+        def convert(source, _command):
+            if source.name == "broken.pptx":
+                return None, "LibreOffice conversion failed"
+            pdf = source.with_suffix(".pdf")
+            pdf.write_bytes(b"%PDF")
+            return pdf, ""
+
+        drive.files.return_value.get.side_effect = metadata
+        with tempfile.TemporaryDirectory() as directory:
+            course_dir = pathlib.Path(directory) / "Course"
+            course_dir.mkdir()
+            (course_dir / "existing.pdf").write_bytes(b"existing")
+            downloader.save_index({"existing.pdf": "Course/existing.pdf"})
+            with mock.patch.object(downloader, "check_libreoffice_available", return_value=(True, "soffice")), \
+                 mock.patch.object(downloader, "download_drive_file", side_effect=download), \
+                 mock.patch.object(downloader, "convert_to_pdf", side_effect=convert), \
+                 mock.patch.object(downloader.time, "sleep"):
+                code, output = self.run_cli(drive, files, directory, answers=["all", "y", "n", "n", "n"])
+        self.assertEqual(code, 0)
+        for position, (outcome, name) in enumerate(zip([
+            "Downloaded", "Converted", "Conversion failed", "Skipped video",
+            "Skipped existing", "Download failed", "Download failed",
+        ], names), 1):
+            self.assertIn(f"[{position}/7] {outcome}: {name}", output)
+        self.assertIn("[3/7] Conversion failed: broken.pptx - LibreOffice conversion failed", output)
+        self.assertIn("[7/7] Download failed: unknown.pdf - Failed to fetch file metadata", output)
+        self.assertNotIn("[6/7] Downloaded", output)
+        self.assertEqual(downloader.load_index(), {
+            "existing.pdf": "Course/existing.pdf", "notes.pdf": "Course/notes.pdf",
+            "slides.pptx": "Course/slides.pptx", "broken.pptx": "Course/broken.pptx",
+        })
+
+    def test_progress_labels_dry_run_as_planned_not_completed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            drive = mock.Mock()
+            drive.files.return_value.get.return_value.execute.return_value = {
+                "name": "slides.pptx", "mimeType": "application/vnd.ms-powerpoint",
+            }
+            with mock.patch.object(downloader, "check_libreoffice_available", return_value=(True, "soffice")), \
+                 mock.patch.object(downloader, "convert_to_pdf") as convert:
+                code, output = self.run_cli(
+                    drive, [CourseFile("id", "slides.pptx")], directory,
+                    answers=["all", "y", "n", "y", "y"], extra_args=["--dry-run"],
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("Course [1/1] Course: 1 discovered files", output)
+            self.assertIn("[1/1] Dry run (planned, not downloaded): slides.pptx", output)
+            self.assertNotIn("[1/1] Downloaded:", output)
+            self.assertNotIn("[1/1] Converted:", output)
+            self.assertIn("dry_run: 1", output)
+            convert.assert_not_called()
+            self.assertFalse(self.index_path.exists())
+            self.assertEqual(list(pathlib.Path(directory).iterdir()), [])
+
     def test_interrupted_conversion_retains_completed_source_in_index(self):
         with tempfile.TemporaryDirectory() as directory:
             drive = mock.Mock()
@@ -91,6 +189,8 @@ class CliDownloaderTests(unittest.TestCase):
                 )
             self.assertEqual(code, 130)
             self.assertIn("Download summary", output)
+            self.assertIn("[1/1] Processing: slides.pptx", output)
+            self.assertNotIn("[1/1] Converted:", output)
             self.assertEqual(downloader.load_index(), {"file-id": "Course/slides.pptx"})
             self.assertTrue((pathlib.Path(directory) / "Course/slides.pptx").is_file())
 
@@ -191,6 +291,9 @@ class CliDownloaderTests(unittest.TestCase):
             self.assertEqual(downloader.load_index(), {"first-id": "Course/first.pdf"})
             self.assertIn("interrupted", output.lower())
             self.assertIn("downloaded: 1", output)
+            self.assertIn("[1/2] Downloaded: first.pdf", output)
+            self.assertIn("[2/2] Processing: second.pdf", output)
+            self.assertNotIn("[2/2] Downloaded:", output)
 
     def test_ctrl_c_before_the_first_download_does_not_mark_a_file_complete(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -200,6 +303,8 @@ class CliDownloaderTests(unittest.TestCase):
             self.assertEqual(code, 130)
             self.assertEqual(downloader.load_index(), {})
             self.assertNotIn("downloaded:", output)
+            self.assertIn("[1/1] Processing: notes.pdf", output)
+            self.assertNotIn("[1/1] Downloaded:", output)
 
     def test_ctrl_c_dry_run_does_not_write_the_index(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -213,6 +318,9 @@ class CliDownloaderTests(unittest.TestCase):
             )
             self.assertEqual(code, 130)
             self.assertIn("dry_run: 1", output)
+            self.assertIn("[1/2] Dry run (planned, not downloaded): first.pdf", output)
+            self.assertIn("[2/2] Processing: second.pdf", output)
+            self.assertNotIn("[2/2] Dry run", output)
             self.assertFalse(self.index_path.exists())
             self.assertEqual(list(pathlib.Path(directory).iterdir()), [])
 

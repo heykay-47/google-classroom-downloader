@@ -353,13 +353,43 @@ function toggleAllFiles(checked){
 const convertWord = document.getElementById("convertWord");
 const convertPowerPoint = document.getElementById("convertPowerPoint");
 const replaceOriginals = document.getElementById("replaceOriginals");
+const downloadOptions = {
+  skip_videos: document.querySelector("input[name='skip_videos']"),
+  convert_word: convertWord,
+  convert_powerpoint: convertPowerPoint,
+  replace_originals: replaceOriginals,
+};
+const downloadOptionsKey = "gcr-downloader.download-options";
 
 function updateReplaceControl(){
   replaceOriginals.disabled = !(convertWord.checked || convertPowerPoint.checked);
   if(replaceOriginals.disabled){replaceOriginals.checked = false;}
 }
-convertWord.addEventListener("change", updateReplaceControl);
-convertPowerPoint.addEventListener("change", updateReplaceControl);
+try{
+  const savedOptions = JSON.parse(localStorage.getItem(downloadOptionsKey));
+  if(savedOptions && typeof savedOptions === "object" && !Array.isArray(savedOptions)){
+    Object.entries(downloadOptions).forEach(([name, control])=>{
+      if(typeof savedOptions[name] === "boolean"){control.checked = savedOptions[name];}
+    });
+  }
+} catch (_e) {
+  // Storage can be corrupt or blocked; keep the form's defaults.
+}
+updateReplaceControl();
+
+Object.values(downloadOptions).forEach((control)=>{
+  control.addEventListener("change", ()=>{
+    updateReplaceControl();
+    try{
+      const preferences = Object.fromEntries(
+        Object.entries(downloadOptions).map(([name, option])=>[name, option.checked])
+      );
+      localStorage.setItem(downloadOptionsKey, JSON.stringify(preferences));
+    } catch (_e) {
+      // Saving preferences is optional; downloads must remain usable.
+    }
+  });
+});
 
 function updateCourseCount(){
   const cards = Array.from(document.querySelectorAll(".course-card")).filter((c)=>!c.classList.contains("hidden"));
