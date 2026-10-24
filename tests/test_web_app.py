@@ -22,6 +22,20 @@ from gcr_downloader.models import (
 
 
 class WebAppTests(unittest.TestCase):
+    def test_file_api_preserves_ids_names_and_exposes_catalog_metadata_without_drive(self):
+        request = type("Request", (), {"session": {"token": {}}, "query_params": {}})()
+        files = [CourseFile("a", "Notes.pdf", "assignment", "post-1", "Week 1", None, "pdf")]
+        with mock.patch.object(main.Credentials, "from_authorized_user_info", return_value=object(), create=True), \
+             mock.patch.object(main, "build", return_value=object()) as build, \
+             mock.patch.object(main, "list_course_files", return_value=files):
+            result = main.get_course_files(request, "course-1")
+        self.assertEqual(result, [{
+            "id": "a", "name": "Notes.pdf", "source_kind": "assignment", "post_id": "post-1",
+            "post_title": "Week 1", "post_date": None, "file_type": "pdf",
+        }])
+        self.assertEqual(build.call_count, 1)
+        self.assertEqual(build.call_args.args[:2], ("classroom", "v1"))
+
     def test_safe_filename_rejects_dot_path_components(self):
         self.assertEqual(drive.safe_filename("."), "file")
         self.assertEqual(drive.safe_filename(".."), "file")
@@ -33,13 +47,13 @@ class WebAppTests(unittest.TestCase):
         self.assertNotIn("/api/download/progress", paths)
 
     def test_download_rejects_empty_file_selection(self):
-        request = type("Request", (), {"session": {"token": {}}})()
+        request = type("Request", (), {"session": {"token": {}}, "query_params": {}})()
         with self.assertRaises(main.HTTPException) as error:
             main.download(request, course_id="course-1", file_ids=None)
         self.assertEqual(error.exception.status_code, 400)
 
     def test_download_rejects_file_not_attached_to_course(self):
-        request = type("Request", (), {"session": {"token": {}}})()
+        request = type("Request", (), {"session": {"token": {}}, "query_params": {}})()
         course = Course("course-1", "Course", "ACTIVE")
         available = [CourseFile("allowed", "Allowed")]
         with mock.patch.object(main.Credentials, "from_authorized_user_info", return_value=object(), create=True), \
@@ -51,7 +65,7 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(error.exception.status_code, 400)
 
     def test_course_catalog_failure_returns_502_before_preparation(self):
-        request = type("Request", (), {"session": {"token": {}}})()
+        request = type("Request", (), {"session": {"token": {}}, "query_params": {}})()
         with mock.patch.object(main.Credentials, "from_authorized_user_info", return_value=object(), create=True), \
              mock.patch.object(main, "build", side_effect=[object(), object()]), \
              mock.patch.object(main, "get_course", side_effect=CatalogError("Failed to fetch course")), \
@@ -62,7 +76,7 @@ class WebAppTests(unittest.TestCase):
         prepare.assert_not_called()
 
     def test_download_builds_non_destructive_options(self):
-        request = type("Request", (), {"session": {"token": {}}})()
+        request = type("Request", (), {"session": {"token": {}}, "query_params": {}})()
         course = Course("course-1", "Course", "ACTIVE")
         selected = [CourseFile("file-1", "Notes")]
         response = object()

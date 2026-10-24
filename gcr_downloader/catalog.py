@@ -3,8 +3,10 @@ Classroom catalog: course listing, lookup, and file enumeration shared by
 the web app and the local CLI.
 """
 
+from pathlib import PurePosixPath
+
 from gcr_downloader.files import validate_course_id, validate_file_id
-from gcr_downloader.models import Course, CourseFile
+from gcr_downloader.models import Course, CourseFile, SourceKind
 
 
 class CatalogError(RuntimeError):
@@ -63,15 +65,23 @@ def list_course_files(classroom, course_id: str) -> list[CourseFile]:
     files: list[CourseFile] = []
     seen: set[str] = set()
 
-    def collect(payload: dict, key: str, fallback: str) -> None:
+    def collect(payload: dict, key: str, fallback: str, source_kind: SourceKind) -> None:
         for post in payload.get(key, []):
-            title = post.get("title", fallback)
+            title = post.get("title") or fallback
             for material in post.get("materials", []):
                 drive_file = material.get("driveFile", {}).get("driveFile", {})
                 file_id = drive_file.get("id")
                 if validate_file_id(file_id) and file_id not in seen:
                     seen.add(file_id)
-                    files.append(CourseFile(file_id, drive_file.get("title") or title))
+                    extension = PurePosixPath(drive_file.get("title") or "").suffix.lstrip(".").lower()
+                    files.append(CourseFile(
+                        file_id, drive_file.get("title") or title,
+                        source_kind=source_kind,
+                        post_id=post.get("id") or None,
+                        post_title=title,
+                        post_date=post.get("creationTime") or None,
+                        file_type=extension if extension.isalnum() and len(extension) <= 12 else None,
+                    ))
 
     try:
         page_token = None
@@ -80,7 +90,7 @@ def list_course_files(classroom, course_id: str) -> list[CourseFile]:
                 courseId=course_id,
                 pageToken=page_token,
             ).execute()
-            collect(payload, "courseWork", "Assignment")
+            collect(payload, "courseWork", "Assignment", "assignment")
             page_token = payload.get("nextPageToken")
             if not page_token:
                 break
@@ -91,7 +101,7 @@ def list_course_files(classroom, course_id: str) -> list[CourseFile]:
                 courseId=course_id,
                 pageToken=page_token,
             ).execute()
-            collect(payload, "courseWorkMaterial", "Material")
+            collect(payload, "courseWorkMaterial", "Material", "material")
             page_token = payload.get("nextPageToken")
             if not page_token:
                 break
@@ -102,7 +112,7 @@ def list_course_files(classroom, course_id: str) -> list[CourseFile]:
                 courseId=course_id,
                 pageToken=page_token,
             ).execute()
-            collect(payload, "announcements", "Announcement")
+            collect(payload, "announcements", "Announcement", "announcement")
             page_token = payload.get("nextPageToken")
             if not page_token:
                 return files
