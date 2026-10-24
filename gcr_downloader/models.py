@@ -24,6 +24,11 @@ class Course:
 class CourseFile:
     id: str
     title_hint: str
+    source_kind: str | None = None
+    post_id: str | None = None
+    post_title: str | None = None
+    post_date: str | None = None
+    file_type: str | None = None
 
 
 @dataclass(frozen=True)
