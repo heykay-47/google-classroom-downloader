@@ -242,10 +242,14 @@ function typeLabel(type){
   return type ? `${names[type] || type.toUpperCase()} — filename extension` : "Unknown type";
 }
 
+function typeFilterValue(type){
+  return type ? `extension:${type}` : "unknown";
+}
+
 function renderFiles(files){
   fileList.replaceChildren();
-  const types = [...new Set(files.map((item)=>item.file_type || "unknown"))].sort();
-  types.forEach((type)=>fileTypeFilter.add(new Option(typeLabel(type === "unknown" ? null : type), type)));
+  const types = [...new Set(files.map((item)=>item.file_type || ""))].sort();
+  types.forEach((type)=>fileTypeFilter.add(new Option(typeLabel(type), typeFilterValue(type))));
   const groups = new Map();
   files.forEach((item)=>{
     // Missing post identities must not accidentally merge unrelated posts.
@@ -283,7 +287,7 @@ function renderFiles(files){
     }
     const label = document.createElement("label");
     label.dataset.fileRow = "";
-    label.dataset.fileType = item.file_type || "unknown";
+    label.dataset.fileType = typeFilterValue(item.file_type);
     label.className = "flex items-start gap-2 border-t py-3 hover:bg-gray-50 break-words";
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
