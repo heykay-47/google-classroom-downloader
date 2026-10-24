@@ -12,6 +12,7 @@ __pycache__/
 **/token*.json
 **/download_index.json
 **/.download_index.json.*.tmp
+**/.download_index.json.*.corrupt.bak
 **/downloads/
 **/iiitd-resources/
 **/google-cloud-sdk/

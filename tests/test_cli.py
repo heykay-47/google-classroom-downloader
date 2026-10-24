@@ -840,12 +840,40 @@ class CliDownloaderTests(unittest.TestCase):
 
             self.assertEqual(result, {"first-id": "", "second-id": ""})
 
+    def test_corrupt_index_can_continue_only_after_confirmed_private_backup(self):
+        contents = b'{"downloaded_ids":\xff'
+        self.index_path.write_bytes(contents)
+        old_backup = self.index_path.with_name(".download_index.json.previous.corrupt.bak")
+        old_backup.write_bytes(b"older evidence")
+
+        def proceed(_args, ids, _report):
+            backups = list(self.index_path.parent.glob("*.corrupt.bak"))
+            self.assertEqual(len(backups), 2)
+            backup = next(path for path in backups if path != old_backup)
+            self.assertEqual(backup.read_bytes(), contents)
+            self.assertEqual(self.index_path.read_bytes(), contents)
+            if sys.platform != "win32":
+                self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(ids, {})
+            downloader.save_index({"new": "Course/new.pdf"})
+            return 0
+
+        with mock.patch.object(sys, "argv", ["gcr"]), \
+             mock.patch.object(sys.stdin, "isatty", return_value=True), \
+             mock.patch("builtins.input", return_value="yes") as confirm, \
+             mock.patch.object(downloader, "run_downloads", side_effect=proceed):
+            self.assertEqual(downloader.main(), 0)
+        confirm.assert_called_once()
+        self.assertEqual(old_backup.read_bytes(), b"older evidence")
+        self.assertEqual(downloader.load_index(), {"new": "Course/new.pdf"})
+
     def test_corrupt_index_stops_run_without_overwriting_evidence(self):
         for contents in (b"{", b"[]", b"{}", b'{"downloaded_ids":"bad"}', b'{"downloaded_ids":{"id":null}}', b"\xff"):
             with self.subTest(contents=contents):
                 self.index_path.write_bytes(contents)
                 output = io.StringIO()
                 with mock.patch.object(sys, "argv", ["gcr"]), \
+                     mock.patch.object(sys.stdin, "isatty", return_value=False), \
                      mock.patch.object(downloader, "get_credentials") as auth, \
                      mock.patch("sys.stdout", output):
                     self.assertEqual(downloader.main(), 1)
@@ -853,6 +881,44 @@ class CliDownloaderTests(unittest.TestCase):
                 self.assertEqual(self.index_path.read_bytes(), contents)
                 self.assertIn("index", output.getvalue().lower())
                 self.assertIn("back up", output.getvalue().lower())
+
+    def test_corrupt_index_decline_noninteractive_and_dry_run_have_no_side_effects(self):
+        for interactive, dry_run, answer in ((True, False, "n"), (False, False, "y"), (True, True, "y"), (True, False, EOFError())):
+            with self.subTest(interactive=interactive, dry_run=dry_run, answer=answer):
+                self.index_path.write_bytes(b"corrupt evidence")
+                with mock.patch.object(sys, "argv", ["gcr", *(["--dry-run"] if dry_run else [])]), \
+                     mock.patch.object(sys.stdin, "isatty", return_value=interactive), \
+                     mock.patch("builtins.input", side_effect=[answer]) as confirm, \
+                     mock.patch.object(downloader, "get_credentials") as auth:
+                    self.assertEqual(downloader.main(), 1)
+                auth.assert_not_called()
+                self.assertEqual(confirm.call_count, int(interactive and not dry_run))
+                self.assertEqual(list(self.index_path.parent.iterdir()), [self.index_path])
+                self.assertEqual(self.index_path.read_bytes(), b"corrupt evidence")
+
+    def test_corrupt_index_backup_failure_stops_before_auth_and_preserves_evidence(self):
+        existing = self.index_path.with_name(".download_index.json.previous.corrupt.bak")
+        existing.write_bytes(b"older evidence")
+        for operation, error in (("fsync", OSError("disk full")), ("link", FileExistsError("backup exists")), ("link", PermissionError("no hard links")), ("fsync", KeyboardInterrupt())):
+            with self.subTest(operation=operation, error=error):
+                self.index_path.write_bytes(b"corrupt evidence")
+                with mock.patch.object(sys, "argv", ["gcr"]), \
+                     mock.patch.object(sys.stdin, "isatty", return_value=True), \
+                     mock.patch("builtins.input", return_value="yes"), \
+                     mock.patch.object(downloader.os, operation, side_effect=error), \
+                     mock.patch.object(downloader, "get_credentials") as auth:
+                    self.assertEqual(downloader.main(), 130 if isinstance(error, KeyboardInterrupt) else 1)
+                auth.assert_not_called()
+                self.assertEqual(set(self.index_path.parent.iterdir()), {self.index_path, existing})
+                self.assertEqual(self.index_path.read_bytes(), b"corrupt evidence")
+                self.assertEqual(existing.read_bytes(), b"older evidence")
+
+    def test_corrupt_index_load_itself_still_raises_without_writes(self):
+        self.index_path.write_bytes(b"corrupt evidence")
+        with self.assertRaises(ValueError):
+            downloader.load_index()
+        self.assertEqual(list(self.index_path.parent.iterdir()), [self.index_path])
+        self.assertEqual(self.index_path.read_bytes(), b"corrupt evidence")
 
     def test_missing_index_starts_empty(self):
         self.assertEqual(downloader.load_index(), {})
