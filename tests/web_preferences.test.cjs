@@ -6,6 +6,8 @@ const vm = require('node:vm');
 
 const template = readFileSync(resolve(__dirname, '../app/templates/courses.html'), 'utf8');
 const script = template.match(/<script>([\s\S]*?)<\/script>/)[1]
+  .replace('{% include "download_status.js" %}', () =>
+    readFileSync(resolve(__dirname, '../app/templates/download_status.js'), 'utf8'))
   .replace(/{% if error %}[\s\S]*?{% endif %}/g, '');
 const optionNames = ['skip_videos', 'convert_word', 'convert_powerpoint', 'replace_originals'];
 
@@ -27,6 +29,7 @@ function page(storage = new Map()) {
       appendChild(item) { this.children.push(item); },
       replaceChildren(...items) { this.children = items; },
       setAttribute(name, value) { this[name] = value; },
+      remove() {},
     };
   }
   const ids = Object.fromEntries([...template.matchAll(/id="([^"]+)"/g)].map((match) => [match[1], element()]));
@@ -42,7 +45,10 @@ function page(storage = new Map()) {
     .filter((control) => control.name === 'file_ids');
   const form = element();
   form.querySelectorAll = () => files().filter((control) => control.checked);
+  const submitButton = element();
+  form.querySelector = () => submitButton;
   const document = {
+    cookie: '', body: element(),
     getElementById: (id) => ids[id],
     querySelector: (selector) => selector === "form[action='/download']" ? form
       : options[selector.match(/name=['"]([^'"]+)/)?.[1]],
@@ -53,6 +59,9 @@ function page(storage = new Map()) {
   const requests = [];
   const context = vm.createContext({
     document,
+    window: { addEventListener() {} },
+    crypto: require('node:crypto').webcrypto,
+    setInterval: () => 1, clearInterval() {},
     get localStorage() {
       if (storage instanceof Error) throw storage;
       return { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) };
@@ -88,7 +97,7 @@ test('download options survive a reload without storing file selections or cours
   let prevented = false;
   reloaded.form.dispatch('submit', { preventDefault() { prevented = true; } });
   assert.equal(prevented, false);
-  assert.equal(reloaded.form.target, 'downloadFrame');
+  assert.match(reloaded.form.target, /^download_[a-f0-9]{32}$/);
   assert.deepEqual(reloaded.requests, ['/api/courses/course-b/files']);
 });
 
@@ -126,7 +135,7 @@ test('unavailable or failing storage never blocks drawer changes or downloads', 
     assert.equal(current.options.replace_originals.checked, true);
     await current.open('course-a');
     current.form.dispatch('submit', { preventDefault() { assert.fail('download should work'); } });
-    assert.equal(current.form.target, 'downloadFrame');
+    assert.match(current.form.target, /^download_[a-f0-9]{32}$/);
   }
 });
 
